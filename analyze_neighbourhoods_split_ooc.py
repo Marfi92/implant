@@ -1,25 +1,24 @@
+#!/usr/bin/env python3
 import argparse
 import json
 from pathlib import Path
 import pickle
-from collections import Counter, defaultdict
+from collections import defaultdict
 from hashlib import md5
+import multiprocessing
+import random
 
 import numpy as np
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_curve, precision_recall_curve, precision_score, recall_score, f1_score
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 import h5py
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-import random
-import multiprocessing
 
-
-# ============================================================
-# STEP 1: make_random_split (FIXED)
-# Changes: nfolds -> n_folds=10, fixed parameter ordering
-# ============================================================
+# -------------------------
+# Split generation helpers
+# -------------------------
 def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
     random.seed(seed)
     all_splits = {}
@@ -45,10 +44,6 @@ def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
     return all_splits
 
 
-# ============================================================
-# STEP 2: generate_and_save_split (FIXED)
-# Changes: fixed open() parenthesis, fixed print f-string closing quote
-# ============================================================
 def generate_and_save_split(master_list_path, output_json_path):
     with open(master_list_path, "r", encoding="utf-8") as fp:
         master_list = [line.strip() for line in fp if line.strip()]
@@ -58,21 +53,20 @@ def generate_and_save_split(master_list_path, output_json_path):
     with open(output_json_path, "w", encoding="utf-8") as fp:
         json.dump(splits, fp, indent=2, ensure_ascii=False)
 
-    print(f"\nSaved 100 random splits to: {output_json_path}\n")
+    print(f"\nSaved {len(splits)} random splits to: {output_json_path}\n")
 
 
-# ============================================================
-# STEP 3: NeighbourHoodDataset (NO CHANGES)
-# ============================================================
+# -------------------------
+# Dataset wrapper
+# -------------------------
 class NeighbourHoodDataset(Dataset):
     def __init__(self, neighbourhoods_dir: Path):
         self.neighbourhood_files = sorted(neighbourhoods_dir.glob("*.pkl"))
         neighbourhood_hash = md5()
-        for neighbourhood_file in tqdm(self.neighbourhood_files):
+        for neighbourhood_file in tqdm(self.neighbourhood_files, desc="Hashing neighbourhood files"):
             neighbourhood_hash.update(str(neighbourhood_file).encode('utf-8'))
 
         self.neighbourhood_hash = neighbourhood_hash.hexdigest()
-
         super().__init__()
 
     def __len__(self):
@@ -84,9 +78,6 @@ class NeighbourHoodDataset(Dataset):
         return neighbourhood
 
 
-# ============================================================
-# STEP 4: no_tensor_collator (NO CHANGES)
-# ============================================================
 def no_tensor_collator(batch):
     return batch
 
@@ -94,29 +85,24 @@ def no_tensor_collator(batch):
 EVAL_METRICS = ('roc_auc', 'precision', 'recall', 'f1')
 
 
-# ============================================================
-# STEP 5: main() (MODIFIED)
-# Changes:
-#   - Added --splits-file argument
-#   - Added split-based evaluation loop
-#   - Added aggregation of results across splits
-#   - Fixed --maste-list typo -> --master-list
-# ============================================================
+# -------------------------
+# Main
+# -------------------------
 def main():
     parser = argparse.ArgumentParser(description="Analyze the neighbourhoods extracted from a vector database for a given test dataset.")
-    parser.add_argument('neighbourhoods', help='The directory containing the neighbourhoods extracted from the vector database. This should be the output directory of the `extract_neighbourhoods` script.', type=Path)
-    parser.add_argument('--output-dir', help='The directory to write the analysis results to.', type=Path)
-    parser.add_argument('--num-workers', help='The number of workers to use for processing the neighbourhoods.', type=int, default=0)
-    parser.add_argument('--recalculate', help='If set, recalculate the votes file HDF5 store', action='store_true')
-    parser.add_argument('--threshold-metric', help="What metric to use for setting the threshold", choices=('f1', 'ba'), default='f1')
-    parser.add_argument('--chunk-size', help="How large chunks of data to write to store", type=int, default=2**16)
+    parser.add_argument('neighbourhoods', help='Directory with neighbourhood .pkl files (positional).', type=Path)
+    parser.add_argument('--output-dir', help='Directory to write analysis results to.', type=Path)
+    parser.add_argument('--num-workers', help='Number of workers for processing.', type=int, default=0)
+    parser.add_argument('--recalculate', help='If set, recalculate the votes HDF5 store', action='store_true')
+    parser.add_argument('--threshold-metric', help="Metric to use for setting threshold", choices=('f1', 'ba'), default='f1')
+    parser.add_argument('--chunk-size', help="Chunk size for HDF5 writes", type=int, default=2**16)
 
-    # new arguments for split generation
-    parser.add_argument('--make-splits', help='Generate 100 random 80/10/10 implant splits and exit.', action='store_true')
+    # split generation
+    parser.add_argument('--make-splits', help='Generate random 80/10/10 splits and exit.', action='store_true')
     parser.add_argument('--master_list', help='Path to master implant list for split generation.', type=Path)
-    parser.add_argument('--split_output', help='where to save the generated split JSON.', type=Path, default="implant_splits.json")
+    parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
 
-    # NEW: argument for split-based evaluation
+    # split-based evaluation
     parser.add_argument('--splits-file', help='Path to the splits JSON file for split-based evaluation.', type=Path)
 
     args = parser.parse_args()
@@ -124,53 +110,51 @@ def main():
     # --- Split generation mode ---
     if args.make_splits:
         if not args.master_list:
-            raise ValueError("Provide --master-list when using --make-splits")
+            raise ValueError("Provide --master_list when using --make-splits")
         generate_and_save_split(args.master_list, args.split_output)
         return
 
     # --- Analysis mode ---
     output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
-
-    # We'll start by extracting all the statistics for the neighbourhoods into ndarrays.
-    # We'll work under the assumption that they will fit in memory
     neighbours_dataset = NeighbourHoodDataset(args.neighbourhoods)
     output_dir.mkdir(exist_ok=True, parents=True)
-    votes_file = output_dir / f"neigbourhood_analysis_{neighbours_dataset.neighbourhood_hash}.h5"
+    votes_file = output_dir / f"neighbourhood_analysis_{neighbours_dataset.neighbourhood_hash}.h5"
 
     if args.recalculate or not votes_file.exists():
         partial_file: Path = votes_file.with_suffix('.tmp')
-        dataloader = DataLoader(neighbours_dataset, batch_size=1, num_workers=args.num_workers, drop_last=False, collate_fn=no_tensor_collator)
-
+        dataloader = DataLoader(
+            neighbours_dataset,
+            batch_size=1,
+            num_workers=args.num_workers,
+            drop_last=False,
+            collate_fn=no_tensor_collator
+        )
         with h5py.File(partial_file, 'w') as store:
             n_words = 0
             query_word_classes = []
+            query_word_lists = []   # NEW
             votes = []
-            # NEW: also store query words for split filtering
-            query_words_list = []
-
-            for batch in tqdm(dataloader):
+            for batch in tqdm(dataloader, desc="Reading neighbourhoods"):
                 for example in batch:
+                    batch_query_words = example.get('query_words', [])
                     batch_query_word_classes = example['query_word_classes']
                     n_batch_words = len(batch_query_word_classes)
                     n_words += n_batch_words
-                    query_word_classes.append(batch_query_word_classes)
-                    batch_votes = example['votes']
-                    votes.append(batch_votes)
 
-                    # NEW: store query words if available
-                    if 'query_words' in example:
-                        query_words_list.extend(example['query_words'])
+                    query_word_lists.append(batch_query_words)
+                    query_word_classes.append(batch_query_word_classes)
+                    votes.append(example['votes'])
 
                     if n_words >= args.chunk_size:
-                        n_words, query_word_classes, votes = record_results(store, query_word_classes, votes, args.chunk_size)
+                        n_words, query_word_classes, votes, query_word_lists = record_results(
+                            store, query_word_classes, votes, args.chunk_size, query_word_lists
+                        )
 
-            # We'll do a sweep on the number of neighbours and the cosine similarity threshold to
-            # analyze the sensitivity and specificity of the neighbourhoods.
-            # roc_auc_scores = compute_nearest_neighbour_rocauc(query_word_classes, neighbourhood_classes, n_neighbours)
-            record_results(store, query_word_classes, votes, args.chunk_size)
+            # flush remaining
+            record_results(store, query_word_classes, votes, args.chunk_size, query_word_lists)
         partial_file.rename(votes_file)
 
-    # --- Standard analysis (no splits) ---
+    # If no splits-file provided -> standard analysis
     if not args.splits_file:
         metrics_file = output_dir / "analyzed_neighbourhoods.csv"
         if not metrics_file.exists() or args.recalculate:
@@ -179,7 +163,6 @@ def main():
         else:
             metrics_df = pd.read_csv(metrics_file)
 
-        # Plot results
         for eval_metric in EVAL_METRICS:
             for threshold_on, threshold_df in metrics_df.groupby('threshold_on'):
                 plt.figure()
@@ -192,28 +175,21 @@ def main():
                 plt.ylabel(f"{eval_metric} Score")
                 plt.title(f"{eval_metric} vs Number of Neighbours (thresholded on {threshold_on})")
                 plt.legend()
-
                 plt.savefig(output_dir / f"{threshold_on}_{eval_metric}_vs_neighbours.png")
-                plt.show()
-
-    # --- NEW: Split-based evaluation ---
+                plt.close()
     else:
+        # Split-based evaluation
         print(f"\nRunning split-based evaluation using: {args.splits_file}")
-
         with open(args.splits_file, "r", encoding="utf-8") as fp:
             splits = json.load(fp)
-
         print(f"Loaded {len(splits)} splits")
 
-        # Collect all results across splits
         all_split_results = []
-
         for split_id, split_data in tqdm(splits.items(), desc="Evaluating splits"):
             ref_words = set(split_data["ref"])
             dev_words = set(split_data["dev"])
             test_words = set(split_data["test"])
 
-            # Compute statistics for this split
             split_metrics = compute_statistics_with_split(
                 votes_file,
                 ref_words=ref_words,
@@ -227,15 +203,11 @@ def main():
                 all_split_results.append(split_metrics)
 
         if all_split_results:
-            # Combine all split results into a DataFrame
             results_df = pd.DataFrame(all_split_results)
-
-            # Save per-split results
             per_split_file = output_dir / "per_split_results.csv"
             results_df.to_csv(per_split_file, index=False)
             print(f"\nPer-split results saved to: {per_split_file}")
 
-            # Compute aggregated statistics (mean and std)
             numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
             available_cols = [c for c in numeric_cols if c in results_df.columns]
 
@@ -248,7 +220,6 @@ def main():
             agg_file = output_dir / "aggregated_split_results.csv"
             agg_df.to_csv(agg_file, index=False)
 
-            # Print summary
             print("\n" + "="*60)
             print("AGGREGATED RESULTS ACROSS ALL SPLITS")
             print("="*60)
@@ -258,33 +229,32 @@ def main():
                 print(f"  {col:>20s}: {mean_val:.4f} ± {std_val:.4f}")
             print("="*60)
 
-            # Plot distributions
             for metric in available_cols:
                 if metric == 'threshold':
                     continue
                 plt.figure(figsize=(8, 5))
                 plt.hist(results_df[metric], bins=20, edgecolor='black', alpha=0.7)
-                plt.xlabel(f"{metric}")
-                plt.ylabel("Count")
                 mean_val = results_df[metric].mean()
-                std_val = results_df[metric].std()
-                plt.title(f"Distribution of {metric} across {len(results_df)} splits\nMean: {mean_val:.4f} ± {std_val:.4f}")
                 plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
+                plt.xlabel(metric)
+                plt.ylabel("Count")
+                plt.title(f"Distribution of {metric} across {len(results_df)} splits\nMean: {mean_val:.4f}")
                 plt.legend()
                 plt.tight_layout()
                 plt.savefig(output_dir / f"split_distribution_{metric}.png")
                 plt.close()
-
             print(f"\nDistribution plots saved to: {output_dir}")
         else:
             print("WARNING: No split results were computed. Check your splits file and data.")
 
+# -------------------------
+# HDF5 record / compute helpers
+# -------------------------
+def record_results(store: h5py.File, query_word_classes, votes, chunk_size, query_word_lists):
+    if len(query_word_classes) == 0:
+        return 0, [], [], []
 
-# ============================================================
-# STEP 6: record_results (NO CHANGES)
-# ============================================================
-def record_results(store: h5py.File, query_word_classes, votes, chunk_size):
-    # First we prepare the data by concatenating all arrays
+    # classes
     concatenated_query_word_classes = np.concatenate(query_word_classes)
     store_query_word_classes = concatenated_query_word_classes[:chunk_size]
     remaining_query_word_classes_arr = concatenated_query_word_classes[chunk_size:]
@@ -293,38 +263,53 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size):
     if n_remaining > 0:
         remaining_word_classes.append(remaining_query_word_classes_arr)
 
+    # query words
+    concatenated_query_words = np.concatenate(query_word_lists).astype('U') if query_word_lists else np.array([], dtype='U')
+    store_query_words = concatenated_query_words[:chunk_size]
+    remaining_query_words_arr = concatenated_query_words[chunk_size:]
+    remaining_query_words = []
+    if len(remaining_query_words_arr) > 0:
+        remaining_query_words.append(remaining_query_words_arr)
+
+    # write / append classes
     if 'query_word_classes' not in store:
-        ds = store.create_dataset('query_word_classes', data=store_query_word_classes, maxshape=(None,), chunks=(chunk_size,))
+        store.create_dataset('query_word_classes', data=store_query_word_classes, maxshape=(None,), chunks=(chunk_size,))
     else:
         ds = store['query_word_classes']
-        current_size = ds.shape[0]
-        new_size = current_size + len(store_query_word_classes)
-        ds.resize(new_size, axis=0)
-        ds[current_size:new_size] = store_query_word_classes
+        cur = ds.shape[0]
+        new = cur + len(store_query_word_classes)
+        ds.resize((new,), axis=0)
+        ds[cur:new] = store_query_word_classes
 
-    #max_neighbours = max(max_neighbours, partial_results["max_neighbours"])
+    # write / append query words
+    dt = h5py.string_dtype(encoding='utf-8')
+    if 'query_words' not in store:
+        store.create_dataset('query_words', data=store_query_words, maxshape=(None,), dtype=dt, chunks=(chunk_size,))
+    else:
+        dsw = store['query_words']
+        cur = dsw.shape[0]
+        new = cur + store_query_words.shape[0]
+        dsw.resize((new,), axis=0)
+        dsw[cur:new] = store_query_words
 
-    # The votes is a list of dictionaries. Each dictionary is from weighting_function
-    # to neighbourhood_votes. The neighbourhood votes is a dictionary with one key per
-    # neighbourhood size to the array of votes for that size.
-    # We start by flattening the batched votes
+    # flatten votes
     flattened_votes = defaultdict(lambda: defaultdict(list))
     for votes_batch in votes:
-        for weighting_function, neighbour_votes in votes_batch.items():
+        for weight_type, neighbour_votes in votes_batch.items():
             for n, votes_array in neighbour_votes.items():
-                flattened_votes[weighting_function][n].append(votes_array)
+                flattened_votes[weight_type][n].append(votes_array)
 
     remaining_votes_batch = {}
-    any_remaining_votes = False
-    for weighting_function, neighbour_votes in flattened_votes.items():
-        g = store.require_group(weighting_function)
+    any_remaining = False
+
+    for weight_type, neighbour_votes in flattened_votes.items():
+        g = store.require_group(weight_type)
         all_n_neighbours = set(int(n) for n in neighbour_votes.keys())
         if 'n_neighbours' in g.attrs:
             all_n_neighbours.update(g.attrs['n_neighbours'])
         g.attrs['n_neighbours'] = sorted(all_n_neighbours)
 
         remaining_neighbour_votes = {}
-
         for n_neighbours, votes_value in neighbour_votes.items():
             concatenated_vote_values = np.concatenate(votes_value)
             store_vote_values = concatenated_vote_values[:chunk_size]
@@ -334,33 +319,25 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size):
                 g.create_dataset(str(n_neighbours), data=store_vote_values, maxshape=(None,), chunks=(chunk_size,))
             else:
                 ds = g[str(n_neighbours)]
-                current_size = ds.shape[0]
-                new_size = current_size + store_vote_values.shape[0]
-                ds.resize(new_size, axis=0)
-                ds[current_size:new_size] = store_vote_values
-            n_remaining_votes = len(remaining_vote_values_arr)
-            if n_remaining_votes != n_remaining:
+                cur = ds.shape[0]
+                new = cur + store_vote_values.shape[0]
+                ds.resize((new,), axis=0)
+                ds[cur:new] = store_vote_values
+
+            if len(remaining_vote_values_arr) != n_remaining:
                 raise RuntimeError("The remaining number of votes and number of remaining word classes differ")
-            if n_remaining_votes > 0:
+
+            if len(remaining_vote_values_arr) > 0:
                 remaining_neighbour_votes[n_neighbours] = remaining_vote_values_arr
-                any_remaining_votes = True
-        remaining_votes_batch[weighting_function] = remaining_neighbour_votes
+                any_remaining = True
 
-    remaining_votes = []
-    if any_remaining_votes:
-        remaining_votes.append(remaining_votes_batch)
+        remaining_votes_batch[weight_type] = remaining_neighbour_votes
 
-    weighting_functions = set(flattened_votes.keys())
-    if 'weighting_functions' in store.attrs:
-        weighting_functions.update(store.attrs['weighting_function'])
-    store.attrs['weighting_function'] = sorted(weighting_functions)
+    remaining_votes = [remaining_votes_batch] if any_remaining else []
 
-    return n_remaining, remaining_word_classes, remaining_votes
+    return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
 
 
-# ============================================================
-# STEP 7: compute_statistics (NO CHANGES - used for non-split mode)
-# ============================================================
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
@@ -378,14 +355,10 @@ def compute_statistics(votes_file: Path, num_workers=0):
     else:
         records = [statistics_worker(work_package) for work_package in tqdm(work_packages)]
 
-    # The statistics worker returns a list of records, so we flatten this nested structure
     df = pd.DataFrame.from_records([record for record_pair in records for record in record_pair])
     return df
 
 
-# ============================================================
-# STEP 8: statistics_worker (NO CHANGES)
-# ============================================================
 def statistics_worker(work_package):
     store_file, weight_type, n_neighbours = work_package
     records = []
@@ -393,23 +366,17 @@ def statistics_worker(work_package):
         query_word_classes = store['query_word_classes'][:]
         votes = store[weight_type][str(n_neighbours)][:]
         fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
-        roc_auc = np.trapezoid(tpr, fpr)
+        roc_auc = np.trapz(tpr, fpr)
         precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
-
         ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
-        # Figure out which threshold gives us the best Youden's J statistic (sensitivity + specificity - 1)
-        # Since fpr is 1 - specificity and tpr is sensitivity, Youden's J can be calculated as tpr - fpr
         youdens_j = tpr - fpr
         best_threshold_index = np.argmax(youdens_j)
         best_threshold = roc_thresholds[best_threshold_index]
         discretized_votes = votes > best_threshold
-        #precision, recall, f1_score, support = precision_recall_fscore_support(query_word_classes, discretized_votes, beta=1)
-
-        precision = precision_sweep[best_threshold_index]
-        recall = recall_sweep[best_threshold_index]
-        f1 = f1_sweep[best_threshold_index]
-
+        precision = precision_score(query_word_classes, discretized_votes)
+        f1 = f1_score(query_word_classes, discretized_votes)
+        recall = recall_score(query_word_classes, discretized_votes)
         performance_record_ba = {'weight_type': weight_type,
                                  'n_neighbours': n_neighbours,
                                  'roc_auc': roc_auc,
@@ -419,20 +386,16 @@ def statistics_worker(work_package):
                                  'recall': recall,
                                  'f1': f1,
                                  'threshold_on': 'ba'}
-
         records.append(performance_record_ba)
 
-        # precision/recall are length = len(thresholds)+1
         f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
         best_threshold_index = np.argmax(f1_sweep)
         best_threshold = prc_thresholds[best_threshold_index]
         discretized_votes = votes > best_threshold
-
         precision = precision_sweep[best_threshold_index]
         recall = recall_sweep[best_threshold_index]
         f1 = f1_sweep[best_threshold_index]
-
-        performance_record_ba = {'weight_type': weight_type,
+        performance_record_f1 = {'weight_type': weight_type,
                                  'n_neighbours': n_neighbours,
                                  'roc_auc': roc_auc,
                                  'average_precision': ap,
@@ -441,57 +404,46 @@ def statistics_worker(work_package):
                                  'recall': recall,
                                  'f1': f1,
                                  'threshold_on': 'f1'}
-
-    records.append(performance_record_ba)
+        records.append(performance_record_f1)
     return records
 
 
-# ============================================================
-# STEP 9: NEW FUNCTION - compute_statistics_with_split
-# This is the key new function for split-based evaluation.
-# It filters the data to only evaluate on dev/test words.
-# ============================================================
+# -------------------------
+# Split-based evaluation helper
+# -------------------------
 def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, num_workers=0):
-    """
-    Compute statistics using split-based evaluation.
-    - ref_words: known implants (used as positive labels for neighbours)
-    - dev_words: used for threshold tuning
-    - test_words: used for final evaluation
-
-    For now, we evaluate on the combined dev+test set since the
-    current HDF5 structure stores word classes (not word strings).
-    The word classes already encode whether a word is an implant or not.
-    """
-    results = {}
+    best_result = None
+    best_roc_auc = -1
 
     with h5py.File(votes_file, 'r') as store:
         query_word_classes = store['query_word_classes'][:]
-        weighting_functions = store.attrs['weighting_function']
+        raw_qwords = store['query_words'][:]
+        query_words = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
 
-        # Use the first weight type and a reasonable number of neighbours
-        # for the split evaluation
-        best_roc_auc = -1
-        best_result = None
+        test_mask = np.array([w in test_words for w in query_words], dtype=bool)
+        if not test_mask.any():
+            return None
+
+        weighting_functions = store.attrs['weighting_function']
 
         for weight_type in weighting_functions:
             g = store[weight_type]
             all_n_neighbours = g.attrs['n_neighbours']
-
             for n_neighbours in all_n_neighbours:
                 votes = g[str(n_neighbours)][:]
 
-                # Compute metrics
+                votes_test = votes[test_mask]
+                classes_test = query_word_classes[test_mask]
+
                 try:
-                    fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
-                    roc_auc = np.trapezoid(tpr, fpr)
-                    precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
+                    fpr, tpr, roc_thresholds = roc_curve(classes_test, votes_test)
+                    roc_auc = np.trapz(tpr, fpr)
+                    precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes_test, votes_test)
                     ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
-                    # Use F1-based threshold
                     f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
                     best_threshold_index = np.argmax(f1_sweep)
                     best_threshold = prc_thresholds[best_threshold_index]
-
                     precision = precision_sweep[best_threshold_index]
                     recall = recall_sweep[best_threshold_index]
                     f1 = f1_sweep[best_threshold_index]
@@ -508,15 +460,15 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                             'recall': recall,
                             'f1': f1,
                         }
-                except Exception as e:
+                except Exception:
                     continue
 
     return best_result
 
 
-# ============================================================
-# STEP 10: get_arrays_for_file (MINOR FIX: skip_lables -> skip_labels)
-# ============================================================
+# -------------------------
+# File parsing and vote logic
+# -------------------------
 def get_arrays_for_file(neighbourhood_file):
     neighbourhood_classes = []
     neighbourhood_distances = []
@@ -526,30 +478,25 @@ def get_arrays_for_file(neighbourhood_file):
         neighbourhood_data = pickle.load(fp)
         neighbourhoods = neighbourhood_data["neighbourhoods"]
         class_mappings = neighbourhood_data["class_mapping"]
-        # The pickled files contain a list of tuples in the form of
-        # (('query_word', label), [(cossim1, 'neighbour_word1', label1), (cossim2, 'neighbour_word2', label2), ...])
-        # We'll analyze the sensitivity and specificity for different choices of number of
-        # neighbours and different thresholds on the cosine similarity. We will also
-        # analyze the distribution of the cosine similarities for
-        # the relevant and non-relevant neighbours.
 
-        skip_labels = (class_mappings['stop_word'], class_mappings['known_positive'])  # FIXED: skip_lables -> skip_labels
+    skip_labels = (class_mappings.get('stop_word'), class_mappings.get('known_positive'))
+    query_words = []
 
-        n_query_words = len(neighbourhoods)
-        for (query_word, query_label), neighbours in neighbourhoods:
-            if query_label in skip_labels:
-                continue
+    for (query_word, query_label), neighbours in neighbourhoods:
+        if query_label in skip_labels:
+            continue
 
-            max_neighbours = max(max_neighbours, len(neighbours))
-            query_neighbour_classes = []
-            query_distances = []
-            for cossim, neighbour_word, neighbour_label in neighbours:
-                query_neighbour_classes.append(neighbour_label)
-                query_distances.append(cossim)
-            if query_neighbour_classes:  # Stop words will have empty lists, we shouldn't add them
-                query_word_classes.append(query_label)
-                neighbourhood_classes.append(query_neighbour_classes)
-                neighbourhood_distances.append(query_distances)
+        max_neighbours = max(max_neighbours, len(neighbours))
+        query_neighbour_classes = []
+        query_distances = []
+        for cossim, neighbour_word, neighbour_label in neighbours:
+            query_neighbour_classes.append(neighbour_label)
+            query_distances.append(cossim)
+        if query_neighbour_classes:
+            query_word_classes.append(query_label)
+            neighbourhood_classes.append(query_neighbour_classes)
+            neighbourhood_distances.append(query_distances)
+            query_words.append(query_word)
 
     neighbourhood_classes = np.array(neighbourhood_classes, dtype=np.int8)
     neighbourhood_distances = np.array(neighbourhood_distances, dtype=np.float32)
@@ -559,62 +506,38 @@ def get_arrays_for_file(neighbourhood_file):
         or len(neighbourhood_distances) != len(neighbourhood_classes)):
         raise RuntimeError("Array lengths differs")
 
-    n_neighbours = list(range(1, max_neighbours+1))  # We'll use these as indexing ranges, if we don't add by 1 we'll not include the max number of neighbours
+    n_neighbours = list(range(1, max_neighbours+1))
     votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
-    return {"query_word_classes": query_word_classes,
-            "votes": votes}
+    return {
+        "query_words": query_words,
+        "query_word_classes": query_word_classes,
+        "votes": votes
+    }
 
 
-# ============================================================
-# STEP 11: get_votes (NO CHANGES)
-# ============================================================
 def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
     votes = {}
     for weight_type in ['constant', 'inverse', 'exponential']:
         weight_type_votes = {}
-        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)  # This should give us an array of the same shape as neighbourhood distances with the weights for each neighbour
-        neighbour_weighted_classes = neighbour_weights*neighbourhood_classes
-        # for n in n_neighbours:
-        #     closest_neighbours = neighbour_weights[:, :n]
-        #     weighted_neighbour_classes = closest_neighbours * neighbourhood_classes[:, :n]
-        #     summed_class = np.sum(weighted_neighbour_classes, axis=1)
-        #     votes[(weight_type, n)] = summed_class
-
-        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)  # This gives as an array of the same shape as neighbour weights where, for each row, each column contain the sum up to that column
+        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)
+        neighbour_weighted_classes = neighbour_weights * neighbourhood_classes
+        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)
         for i in n_neighbours:
-            # Since one neighbhour corresonds to the first (zeroth) column,
-            # we need to subtract 1 to map the columns correctly
             weight_type_votes[i] = neighbour_cumsums[:, i-1]
         votes[weight_type] = weight_type_votes
-
     return votes
 
 
-# ============================================================
-# STEP 12: weighting_function (NO CHANGES)
-# ============================================================
 def weighting_function(distances, weight_type='inverse', eps=1e-5):
     if weight_type == 'inverse':
-        return 1 / (distances + eps)  # Adding a small value to avoid division by zero
+        return 1 / (distances + eps)
     elif weight_type == 'exponential':
         return np.exp(-distances)
     elif weight_type == 'constant':
-        #n_neighbours = distances.shape[1]
-        # This will give equal weight to all neighbours, while only equalling the
-        # mean in when using all neighbours. If we use a subset of the neighbours, this will give us a
-        # weighted mean where the weights sum to 1.
         return np.ones_like(distances)
-        #return np.full_like(distances, 1.0 / n_neighbours)
     else:
         raise ValueError(f"Unknown weight type: {weight_type}")
-
-
-# ============================================================
-# STEP 13: precision_recall_curve import
-# (This was used in statistics_worker but not imported)
-# ============================================================
-from sklearn.metrics import precision_recall_curve
 
 
 if __name__ == "__main__":
