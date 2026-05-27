@@ -264,12 +264,12 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
         remaining_word_classes.append(remaining_query_word_classes_arr)
 
     # query words
-    concatenated_query_words = np.concatenate(query_word_lists).astype('U') if query_word_lists else np.array([], dtype='U')
+    concatenated_query_words = list(np.concatenate(query_word_lists)) if query_word_lists else []
     store_query_words = concatenated_query_words[:chunk_size]
     remaining_query_words_arr = concatenated_query_words[chunk_size:]
     remaining_query_words = []
     if len(remaining_query_words_arr) > 0:
-        remaining_query_words.append(remaining_query_words_arr)
+        remaining_query_words.append(np.array(remaining_query_words_arr, dtype='U'))
 
     # write / append classes
     if 'query_word_classes' not in store:
@@ -283,14 +283,15 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
 
     # write / append query words
     dt = h5py.string_dtype(encoding='utf-8')
+    store_query_words_encoded = np.array(store_query_words, dtype=object)
     if 'query_words' not in store:
-        store.create_dataset('query_words', data=store_query_words, maxshape=(None,), dtype=dt, chunks=(chunk_size,))
+        store.create_dataset('query_words', data=store_query_words_encoded, maxshape=(None,), dtype=dt, chunks=(chunk_size,))
     else:
         dsw = store['query_words']
         cur = dsw.shape[0]
-        new = cur + store_query_words.shape[0]
+        new = cur + len(store_query_words_encoded)
         dsw.resize((new,), axis=0)
-        dsw[cur:new] = store_query_words
+        dsw[cur:new] = store_query_words_encoded
 
     # flatten votes
     flattened_votes = defaultdict(lambda: defaultdict(list))
