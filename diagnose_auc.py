@@ -1,96 +1,27 @@
-#!/usr/bin/env python3
-"""Diagnostic script to investigate low ROC AUC values.
-
-Run from abragam's machine:
-    python diagnose_auc.py <path-to-votes-h5-file> --splits-file <path-to-splits-json>
-
-Example:
-    python diagnose_auc.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/analysis/neighbourhood_analysis_*.h5 --splits-file /home/abragam23/fedhealth_data/implant_split.json
-"""
 import argparse
 import json
 import glob
+import warnings
 from pathlib import Path
-
+ 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+ 
 import numpy as np
 from sklearn.metrics import roc_curve, roc_auc_score
 import h5py
-
-
+ 
+# Use np.trapezoid if available (numpy >= 2.0), else fall back to np.trapz
+_trapz = getattr(np, 'trapezoid', np.trapz)
+ 
+ 
 def main():
     parser = argparse.ArgumentParser(description="Diagnose low AUC values")
     parser.add_argument('votes_file', help='Path to the HDF5 votes file (supports glob)', type=str)
-    parser.add_argument('--splits-file', help='Path to splits JSON', type=Path)
-    args = parser.parse_args()
-
-    # Resolve glob
-    files = glob.glob(args.votes_file)
-    h5_files = [f for f in files if f.endswith('.h5')]
-    if not h5_files:
-        print(f"ERROR: No .h5 files found matching: {args.votes_file}")
-        print("Try providing the full path to the .h5 file in the analysis/ folder")
-        return
-    votes_file = h5_files[0]
-    print(f"Using votes file: {votes_file}\n")
-
-    print("=" * 60)
-    print("DIAGNOSTIC REPORT")
-    print("=" * 60)
-
-    with h5py.File(votes_file, 'r') as store:
-        query_word_classes = store['query_word_classes'][:]
-        raw_qwords = store['query_words'][:]
-        query_words = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
-        weighting_functions = list(store.attrs['weighting_function'])
-
-        # 1. Check class labels
-        print("\n--- 1. CLASS LABEL ANALYSIS ---")
-        unique_labels, label_counts = np.unique(query_word_classes, return_counts=True)
-        print(f"  Unique class labels: {unique_labels}")
-        print(f"  Label counts: {dict(zip(unique_labels.tolist(), label_counts.tolist()))}")
-        print(f"  Total samples: {len(query_word_classes)}")
-        if len(unique_labels) == 2:
-            pos_rate = label_counts[1] / len(query_word_classes)
-            print(f"  Positive class rate: {pos_rate:.4f} ({label_counts[1]}/{len(query_word_classes)})")
-            if pos_rate < 0.01 or pos_rate > 0.99:
-                print("  WARNING: Highly imbalanced classes! This can affect AUC interpretation.")
-        elif len(unique_labels) < 2:
-            print("  ERROR: Only one class present! AUC is undefined.")
-        else:
-            print("  WARNING: More than 2 classes found. roc_curve expects binary labels.")
-
-        # 2. Check vote score distributions
-        print("\n--- 2. VOTE SCORE DISTRIBUTIONS ---")
-        for weight_type in weighting_functions[:1]:  # Just check first weight type
-            g = store[weight_type]
-            n_neighbours_list = sorted(g.attrs['n_neighbours'])
-            # Check a few representative n_neighbours values
-            for n in [n_neighbours_list[0], n_neighbours_list[len(n_neighbours_list)//2], n_neighbours_list[-1]]:
-                votes = g[str(n)][:]
-                pos_mask = query_word_classes == 1
-                neg_mask = query_word_classes == 0
-                if pos_mask.any() and neg_mask.any():
-                    print(f"\n  Weight={weight_type}, n_neighbours={n}:")
-                    print(f"    Positive class votes: mean={votes[pos_mask].mean():.4f}, std={votes[pos_mask].std():.4f}, "
-                          f"min={votes[pos_mask].min():.4f}, max={votes[pos_mask].max():.4f}")
-                    print(f"    Negative class votes: mean={votes[neg_mask].mean():.4f}, std={votes[neg_mask].std():.4f}, "
-                          f"min={votes[neg_mask].min():.4f}, max={votes[neg_mask].max():.4f}")
-                    overlap = votes[pos_mask].mean() - votes[neg_mask].mean()
-                    print(f"    Mean difference (pos - neg): {overlap:.4f}")
-                    if abs(overlap) < 0.01:
-                        print("    WARNING: Positive and negative vote distributions are nearly identical!")
-
-        # 3. Verify AUC with sklearn directly
-        print("\n--- 3. AUC VERIFICATION (full dataset, no splits) ---")
-        for weight_type in weighting_functions:
-            g = store[weight_type]
-            n_neighbours_list = sorted(g.attrs['n_neighbours'])
-            best_auc = -1
-            best_n = -1
             for n in n_neighbours_list:
                 votes = g[str(n)][:]
                 try:
                     auc_trapz = np.trapz(*roc_curve(query_word_classes, votes)[:2][::-1])
+                    auc_trapz = _trapz(*roc_curve(query_word_classes, votes)[:2][::-1])
                     auc_sklearn = roc_auc_score(query_word_classes, votes)
                     if auc_sklearn > best_auc:
                         best_auc = auc_sklearn
