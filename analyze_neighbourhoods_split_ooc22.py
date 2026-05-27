@@ -333,6 +333,15 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
 
         remaining_votes_batch[weight_type] = remaining_neighbour_votes
 
+    # FIX: Store the weighting function names as a root-level attribute
+    # so that compute_statistics / compute_statistics_with_split can find them.
+    all_weight_types = sorted(flattened_votes.keys())
+    if 'weighting_function' in store.attrs:
+        existing = set(store.attrs['weighting_function'])
+        existing.update(all_weight_types)
+        all_weight_types = sorted(existing)
+    store.attrs['weighting_function'] = all_weight_types
+
     remaining_votes = [remaining_votes_batch] if any_remaining else []
 
     return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
