@@ -277,8 +277,8 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     else:
         ds = store['query_word_classes']
         cur = ds.shape[0]
-        new = cur + len(store_query_word_classes)
-        ds.resize((new,), axis=0)
+        new = int(cur + len(store_query_word_classes))
+        ds.resize(new, axis=0)
         ds[cur:new] = store_query_word_classes
 
     # write / append query words
@@ -289,8 +289,8 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     else:
         dsw = store['query_words']
         cur = dsw.shape[0]
-        new = cur + len(store_query_words_encoded)
-        dsw.resize((new,), axis=0)
+        new = int(cur + len(store_query_words_encoded))
+        dsw.resize(new, axis=0)
         dsw[cur:new] = store_query_words_encoded
 
     # flatten votes
@@ -321,8 +321,8 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
             else:
                 ds = g[str(n_neighbours)]
                 cur = ds.shape[0]
-                new = cur + store_vote_values.shape[0]
-                ds.resize((new,), axis=0)
+                new = int(cur + store_vote_values.shape[0])
+                ds.resize(new, axis=0)
                 ds[cur:new] = store_vote_values
 
             if len(remaining_vote_values_arr) != n_remaining:
