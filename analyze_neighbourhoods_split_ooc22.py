@@ -146,7 +146,7 @@ def main():
             n_words = 0
             query_word_classes = []
             query_word_lists = []
-            distances = []
+            all_data = []  # holds both votes and distances per batch
             for batch in tqdm(dataloader, desc="Reading neighbourhoods"):
                 for example in batch:
                     batch_query_words = example.get('query_words', [])
@@ -156,15 +156,18 @@ def main():
 
                     query_word_lists.append(batch_query_words)
                     query_word_classes.append(batch_query_word_classes)
-                    distances.append(example['distances'])
+                    all_data.append({
+                        'votes': example['votes'],
+                        'distances': example['distances'],
+                    })
 
                     if n_words >= args.chunk_size:
-                        n_words, query_word_classes, distances, query_word_lists = record_results(
-                            store, query_word_classes, distances, args.chunk_size, query_word_lists
+                        n_words, query_word_classes, all_data, query_word_lists = record_results(
+                            store, query_word_classes, all_data, args.chunk_size, query_word_lists
                         )
 
             # flush remaining
-            record_results(store, query_word_classes, distances, args.chunk_size, query_word_lists)
+            record_results(store, query_word_classes, all_data, args.chunk_size, query_word_lists)
         partial_file.rename(votes_file)
 
     # If no splits-file provided -> standard analysis
@@ -205,7 +208,7 @@ def main():
             dev_words = set(split_data["dev"])
             test_words = set(split_data["test"])
 
-            split_metrics = compute_statistics_with_split(
+            split_results = compute_statistics_with_split(
                 votes_file,
                 ref_words=ref_words,
                 dev_words=dev_words,
@@ -213,9 +216,10 @@ def main():
                 num_workers=args.num_workers
             )
 
-            if split_metrics is not None:
-                split_metrics['split_id'] = int(split_id)
-                all_split_results.append(split_metrics)
+            if split_results:
+                for result in split_results:
+                    result['split_id'] = int(split_id)
+                all_split_results.extend(split_results)
 
         if all_split_results:
             results_df = pd.DataFrame(all_split_results)
@@ -223,74 +227,86 @@ def main():
             results_df.to_csv(per_split_file, index=False)
             print(f"\nPer-split results saved to: {per_split_file}")
 
-            numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
-            available_cols = [c for c in numeric_cols if c in results_df.columns]
+            # Print results grouped by approach
+            for approach in results_df['approach'].unique():
+                approach_df = results_df[results_df['approach'] == approach]
+                print(f"\n{'='*70}")
+                print(f"APPROACH: {approach}")
+                print(f"{'='*70}")
 
-            agg_results = {}
-            for col in available_cols:
-                values = results_df[col].dropna().values
-                agg_results[f"{col}_mean"] = np.mean(values)
-                agg_results[f"{col}_std"] = np.std(values, ddof=1)
-                agg_results[f"{col}_median"] = np.median(values)
-                # Bootstrapped 95% CI of the mean
-                ci_lo, ci_hi = bootstrap_ci(values, n_bootstrap=10000)
-                agg_results[f"{col}_ci95_lo"] = ci_lo
-                agg_results[f"{col}_ci95_hi"] = ci_hi
+                # Per-split table
+                print(f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
+                      f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
+                      f"{'Recall':>7s}  {'F1':>7s}")
+                print("-"*70)
+                for _, row in approach_df.iterrows():
+                    print(f"{int(row['split_id']):>6d}  "
+                          f"{row['weight_type']:>12s}  "
+                          f"{int(row['n_neighbours']):>7d}  "
+                          f"{row['roc_auc']:>8.4f}  "
+                          f"{row['precision']:>9.4f}  "
+                          f"{row['average_precision']:>8.4f}  "
+                          f"{row.get('recall', float('nan')):>7.4f}  "
+                          f"{row.get('f1', float('nan')):>7.4f}")
+                print("-"*70)
 
-            agg_df = pd.DataFrame([agg_results])
+                # Aggregated stats
+                numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
+                available_cols = [c for c in numeric_cols if c in approach_df.columns]
+
+                print(f"\n  AGGREGATED ({approach}):")
+                for col in available_cols:
+                    values = approach_df[col].dropna().values
+                    mean_val = np.mean(values)
+                    std_val = np.std(values, ddof=1)
+                    median_val = np.median(values)
+                    ci_lo, ci_hi = bootstrap_ci(values)
+                    print(f"    {col:>20s}: mean={mean_val:.4f} ± {std_val:.4f}  "
+                          f"median={median_val:.4f}  95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
+
+            # Save aggregated results for all approaches
+            agg_rows = []
+            for approach in results_df['approach'].unique():
+                approach_df = results_df[results_df['approach'] == approach]
+                numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
+                available_cols = [c for c in numeric_cols if c in approach_df.columns]
+                agg_row = {'approach': approach}
+                for col in available_cols:
+                    values = approach_df[col].dropna().values
+                    agg_row[f"{col}_mean"] = np.mean(values)
+                    agg_row[f"{col}_std"] = np.std(values, ddof=1)
+                    agg_row[f"{col}_median"] = np.median(values)
+                    ci_lo, ci_hi = bootstrap_ci(values)
+                    agg_row[f"{col}_ci95_lo"] = ci_lo
+                    agg_row[f"{col}_ci95_hi"] = ci_hi
+                agg_rows.append(agg_row)
+            agg_df = pd.DataFrame(agg_rows)
             agg_file = output_dir / "aggregated_split_results.csv"
             agg_df.to_csv(agg_file, index=False)
 
-            # Print per-split details for key metrics
-            print("\n" + "="*70)
-            print("PER-SPLIT RESULTS (roc_auc, precision, average_precision)")
-            print("="*70)
-            print(f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
-                  f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
-                  f"{'Recall':>7s}  {'F1':>7s}")
-            print("-"*70)
-            for _, row in results_df.iterrows():
-                print(f"{int(row['split_id']):>6d}  "
-                      f"{row['weight_type']:>12s}  "
-                      f"{int(row['n_neighbours']):>7d}  "
-                      f"{row['roc_auc']:>8.4f}  "
-                      f"{row['precision']:>9.4f}  "
-                      f"{row['average_precision']:>8.4f}  "
-                      f"{row.get('recall', float('nan')):>7.4f}  "
-                      f"{row.get('f1', float('nan')):>7.4f}")
-            print("-"*70)
+            # Distribution plots per approach
+            for approach in results_df['approach'].unique():
+                approach_df = results_df[results_df['approach'] == approach]
+                for metric in ['roc_auc', 'precision', 'recall', 'f1', 'average_precision']:
+                    if metric not in approach_df.columns:
+                        continue
+                    plt.figure(figsize=(8, 5))
+                    plt.hist(approach_df[metric], bins=20, edgecolor='black', alpha=0.7)
+                    mean_val = approach_df[metric].mean()
+                    plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
+                    plt.xlabel(metric)
+                    plt.ylabel("Count")
+                    plt.title(f"Distribution of {metric} ({approach})\n"
+                              f"across {len(approach_df)} splits, Mean: {mean_val:.4f}")
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.savefig(output_dir / f"split_distribution_{metric}_{approach}.png")
+                    plt.close()
 
-            print("\n" + "="*70)
-            print("AGGREGATED RESULTS ACROSS ALL SPLITS")
-            print("="*70)
-            for col in available_cols:
-                values = results_df[col].dropna().values
-                mean_val = np.mean(values)
-                std_val = np.std(values, ddof=1)
-                median_val = np.median(values)
-                ci_lo = agg_results[f"{col}_ci95_lo"]
-                ci_hi = agg_results[f"{col}_ci95_hi"]
-                print(f"  {col:>20s}: mean={mean_val:.4f} ± {std_val:.4f}  "
-                      f"median={median_val:.4f}  95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
-            print("="*70)
-
-            for metric in available_cols:
-                if metric == 'threshold':
-                    continue
-                plt.figure(figsize=(8, 5))
-                plt.hist(results_df[metric], bins=20, edgecolor='black', alpha=0.7)
-                mean_val = results_df[metric].mean()
-                plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
-                plt.xlabel(metric)
-                plt.ylabel("Count")
-                plt.title(f"Distribution of {metric} across {len(results_df)} splits\nMean: {mean_val:.4f}")
-                plt.legend()
-                plt.tight_layout()
-                plt.savefig(output_dir / f"split_distribution_{metric}.png")
-                plt.close()
             print(f"\nDistribution plots saved to: {output_dir}")
         else:
             print("WARNING: No split results were computed. Check your splits file and data.")
+
 
 def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
     rng = np.random.RandomState(seed)
@@ -305,7 +321,7 @@ def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
 # -------------------------
 # HDF5 record / compute helpers
 # -------------------------
-def record_results(store: h5py.File, query_word_classes, distances, chunk_size, query_word_lists):
+def record_results(store: h5py.File, query_word_classes, all_data, chunk_size, query_word_lists):
     if len(query_word_classes) == 0:
         return 0, [], [], []
 
@@ -348,18 +364,66 @@ def record_results(store: h5py.File, query_word_classes, distances, chunk_size, 
         dsw.resize(new, axis=0)
         dsw[cur:new] = store_query_words_encoded
 
-    # flatten distances (structured like votes: centrality_measure -> n_neighbours -> array)
+    # ---- Write VOTES (vote-based approach) ----
+    flattened_votes = defaultdict(lambda: defaultdict(list))
+    for data_batch in all_data:
+        for weight_type, neighbour_votes in data_batch['votes'].items():
+            for n, votes_array in neighbour_votes.items():
+                flattened_votes[weight_type][n].append(votes_array)
+
+    remaining_votes_batch = {}
+    any_remaining_votes = False
+    votes_group = store.require_group('votes')
+
+    for weight_type, neighbour_votes in flattened_votes.items():
+        g = votes_group.require_group(weight_type)
+        all_n_neighbours = set(int(n) for n in neighbour_votes.keys())
+        if 'n_neighbours' in g.attrs:
+            all_n_neighbours.update(g.attrs['n_neighbours'])
+        g.attrs['n_neighbours'] = sorted(all_n_neighbours)
+
+        remaining_neighbour_votes = {}
+        for n_neighbours, vote_value in neighbour_votes.items():
+            concatenated_vote_values = np.concatenate(vote_value)
+            store_vote_values = concatenated_vote_values[:chunk_size]
+            remaining_vote_values_arr = concatenated_vote_values[chunk_size:]
+
+            if str(n_neighbours) not in g:
+                g.create_dataset(str(n_neighbours), data=store_vote_values, maxshape=(None,), chunks=(chunk_size,))
+            else:
+                ds = g[str(n_neighbours)]
+                cur = ds.shape[0]
+                new = int(cur + store_vote_values.shape[0])
+                ds.resize(new, axis=0)
+                ds[cur:new] = store_vote_values
+
+            if len(remaining_vote_values_arr) != n_remaining:
+                raise RuntimeError("The remaining number of votes and number of remaining word classes differ")
+            if len(remaining_vote_values_arr) > 0:
+                remaining_neighbour_votes[n_neighbours] = remaining_vote_values_arr
+                any_remaining_votes = True
+        remaining_votes_batch[weight_type] = remaining_neighbour_votes
+
+    all_vote_types = sorted(flattened_votes.keys())
+    if 'weighting_function' in votes_group.attrs:
+        existing = set(votes_group.attrs['weighting_function'])
+        existing.update(all_vote_types)
+        all_vote_types = sorted(existing)
+    votes_group.attrs['weighting_function'] = all_vote_types
+
+    # ---- Write DISTANCES (distance-based approach) ----
     flattened_distances = defaultdict(lambda: defaultdict(list))
-    for dist_batch in distances:
-        for centrality_measure, neighbour_distances in dist_batch.items():
+    for data_batch in all_data:
+        for centrality_measure, neighbour_distances in data_batch['distances'].items():
             for n, dist_array in neighbour_distances.items():
                 flattened_distances[centrality_measure][n].append(dist_array)
 
     remaining_distances_batch = {}
-    any_remaining = False
+    any_remaining_distances = False
+    dist_group = store.require_group('distances')
 
     for centrality_measure, neighbour_distances in flattened_distances.items():
-        g = store.require_group(centrality_measure)
+        g = dist_group.require_group(centrality_measure)
         all_n_neighbours = set(int(n) for n in neighbour_distances.keys())
         if 'n_neighbours' in g.attrs:
             all_n_neighbours.update(g.attrs['n_neighbours'])
@@ -382,36 +446,46 @@ def record_results(store: h5py.File, query_word_classes, distances, chunk_size, 
 
             if len(remaining_dist_values_arr) != n_remaining:
                 raise RuntimeError("The remaining number of distances and number of remaining word classes differ")
-
             if len(remaining_dist_values_arr) > 0:
                 remaining_neighbour_distances[n_neighbours] = remaining_dist_values_arr
-                any_remaining = True
-
+                any_remaining_distances = True
         remaining_distances_batch[centrality_measure] = remaining_neighbour_distances
 
-    # Store centrality measure names as root-level attribute
     all_measures = sorted(flattened_distances.keys())
-    if 'centrality_measures' in store.attrs:
-        existing = set(store.attrs['centrality_measures'])
+    if 'centrality_measures' in dist_group.attrs:
+        existing = set(dist_group.attrs['centrality_measures'])
         existing.update(all_measures)
         all_measures = sorted(existing)
-    store.attrs['centrality_measures'] = all_measures
+    dist_group.attrs['centrality_measures'] = all_measures
 
-    remaining_distances = [remaining_distances_batch] if any_remaining else []
+    # Build remaining data
+    remaining_all_data = []
+    if any_remaining_votes or any_remaining_distances:
+        remaining_all_data.append({
+            'votes': remaining_votes_batch,
+            'distances': remaining_distances_batch,
+        })
 
-    return n_remaining, remaining_word_classes, remaining_distances, remaining_query_words
+    return n_remaining, remaining_word_classes, remaining_all_data, remaining_query_words
 
 
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
-        centrality_measures = store.attrs['centrality_measures']
-        for weight_type in centrality_measures:
-            g = store[weight_type]
-            all_n_neighbours = g.attrs['n_neighbours']
-            for n_neighbours in all_n_neighbours:
-                work_package = (votes_file, weight_type, n_neighbours)
-                work_packages.append(work_package)
+        # Vote-based approach
+        if 'votes' in store:
+            vg = store['votes']
+            for weight_type in vg.attrs.get('weighting_function', []):
+                g = vg[weight_type]
+                for n_neighbours in g.attrs['n_neighbours']:
+                    work_packages.append((votes_file, 'votes', weight_type, n_neighbours))
+        # Distance-based approach
+        if 'distances' in store:
+            dg = store['distances']
+            for cm in dg.attrs.get('centrality_measures', []):
+                g = dg[cm]
+                for n_neighbours in g.attrs['n_neighbours']:
+                    work_packages.append((votes_file, 'distances', cm, n_neighbours))
 
     if num_workers > 1:
         with multiprocessing.Pool(num_workers) as pool:
@@ -424,58 +498,66 @@ def compute_statistics(votes_file: Path, num_workers=0):
 
 
 def statistics_worker(work_package):
-    store_file, weight_type, n_neighbours = work_package
+    store_file, approach, weight_type, n_neighbours = work_package
     records = []
     with h5py.File(store_file) as store:
         query_word_classes = store['query_word_classes'][:]
         positive_words = int(np.sum(query_word_classes))
         negative_words = len(query_word_classes) - positive_words
-        # Transform distances to similarity scores: smaller distance -> higher score
-        votes = np.exp(-store[weight_type][str(n_neighbours)][:])
-        fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
+
+        raw_scores = store[approach][weight_type][str(n_neighbours)][:]
+        if approach == 'distances':
+            scores = np.exp(-raw_scores)
+        else:
+            scores = raw_scores
+
+        fpr, tpr, roc_thresholds = roc_curve(query_word_classes, scores)
         roc_auc = _trapz(tpr, fpr)
-        precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
+        precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, scores)
         ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
         youdens_j = tpr - fpr
         best_threshold_index = np.argmax(youdens_j)
         best_threshold = roc_thresholds[best_threshold_index]
-        discretized_votes = votes > best_threshold
-        precision = precision_score(query_word_classes, discretized_votes)
-        f1 = f1_score(query_word_classes, discretized_votes)
-        recall = recall_score(query_word_classes, discretized_votes)
-        performance_record_ba = {'weight_type': weight_type,
-                                 'n_neighbours': n_neighbours,
-                                 'positive_words': positive_words,
-                                 'negative_words': negative_words,
-                                 'roc_auc': roc_auc,
-                                 'average_precision': ap,
-                                 'threshold': best_threshold,
-                                 'precision': precision,
-                                 'recall': recall,
-                                 'f1': f1,
-                                 'threshold_on': 'ba'}
-        records.append(performance_record_ba)
+        discretized = scores > best_threshold
+        prec = precision_score(query_word_classes, discretized)
+        f1_val = f1_score(query_word_classes, discretized)
+        rec = recall_score(query_word_classes, discretized)
+        records.append({
+            'approach': approach,
+            'weight_type': weight_type,
+            'n_neighbours': n_neighbours,
+            'positive_words': positive_words,
+            'negative_words': negative_words,
+            'roc_auc': roc_auc,
+            'average_precision': ap,
+            'threshold': best_threshold,
+            'precision': prec,
+            'recall': rec,
+            'f1': f1_val,
+            'threshold_on': 'ba',
+        })
 
         f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
         best_threshold_index = np.argmax(f1_sweep)
         best_threshold = prc_thresholds[best_threshold_index]
-        discretized_votes = votes > best_threshold
-        precision = precision_sweep[best_threshold_index]
-        recall = recall_sweep[best_threshold_index]
-        f1 = f1_sweep[best_threshold_index]
-        performance_record_f1 = {'weight_type': weight_type,
-                                 'n_neighbours': n_neighbours,
-                                 'positive_words': positive_words,
-                                 'negative_words': negative_words,
-                                 'roc_auc': roc_auc,
-                                 'average_precision': ap,
-                                 'threshold': best_threshold,
-                                 'precision': precision,
-                                 'recall': recall,
-                                 'f1': f1,
-                                 'threshold_on': 'f1'}
-        records.append(performance_record_f1)
+        prec = precision_sweep[best_threshold_index]
+        rec = recall_sweep[best_threshold_index]
+        f1_val = f1_sweep[best_threshold_index]
+        records.append({
+            'approach': approach,
+            'weight_type': weight_type,
+            'n_neighbours': n_neighbours,
+            'positive_words': positive_words,
+            'negative_words': negative_words,
+            'roc_auc': roc_auc,
+            'average_precision': ap,
+            'threshold': best_threshold,
+            'precision': prec,
+            'recall': rec,
+            'f1': f1_val,
+            'threshold_on': 'f1',
+        })
     return records
 
 
@@ -483,8 +565,7 @@ def statistics_worker(work_package):
 # Split-based evaluation helper
 # -------------------------
 def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, num_workers=0):
-    best_result = None
-    best_roc_auc = -1
+    results = []
 
     with h5py.File(votes_file, 'r') as store:
         query_word_classes = store['query_word_classes'][:]
@@ -495,52 +576,70 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if not test_mask.any():
             return None
 
-        centrality_measures = store.attrs['centrality_measures']
+        classes_test = query_word_classes[test_mask]
 
-        for weight_type in centrality_measures:
-            g = store[weight_type]
-            all_n_neighbours = g.attrs['n_neighbours']
-            for n_neighbours in all_n_neighbours:
-                raw_distances = g[str(n_neighbours)][:]
-                # Transform distances to similarity scores
-                votes = np.exp(-raw_distances)
+        # Evaluate both approaches
+        approach_configs = []
+        if 'votes' in store:
+            vg = store['votes']
+            for wt in vg.attrs.get('weighting_function', []):
+                g = vg[wt]
+                for nn in g.attrs['n_neighbours']:
+                    approach_configs.append(('votes', wt, nn))
+        if 'distances' in store:
+            dg = store['distances']
+            for cm in dg.attrs.get('centrality_measures', []):
+                g = dg[cm]
+                for nn in g.attrs['n_neighbours']:
+                    approach_configs.append(('distances', cm, nn))
 
-                votes_test = votes[test_mask]
-                classes_test = query_word_classes[test_mask]
+        best_per_approach = {}  # approach -> best result dict
 
-                try:
-                    fpr, tpr, roc_thresholds = roc_curve(classes_test, votes_test)
-                    roc_auc = _trapz(tpr, fpr)
-                    precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes_test, votes_test)
-                    ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
+        for approach, weight_type, n_neighbours in approach_configs:
+            raw_scores = store[approach][weight_type][str(n_neighbours)][:]
+            if approach == 'distances':
+                scores = np.exp(-raw_scores)
+            else:
+                scores = raw_scores
 
-                    f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
-                    best_threshold_index = np.argmax(f1_sweep)
-                    best_threshold = prc_thresholds[best_threshold_index]
-                    precision = precision_sweep[best_threshold_index]
-                    recall = recall_sweep[best_threshold_index]
-                    f1 = f1_sweep[best_threshold_index]
+            scores_test = scores[test_mask]
 
-                    if roc_auc > best_roc_auc:
-                        best_roc_auc = roc_auc
-                        best_result = {
-                            'weight_type': weight_type,
-                            'n_neighbours': n_neighbours,
-                            'roc_auc': roc_auc,
-                            'average_precision': ap,
-                            'threshold': best_threshold,
-                            'precision': precision,
-                            'recall': recall,
-                            'f1': f1,
-                        }
-                except Exception:
-                    continue
+            try:
+                fpr, tpr, roc_thresholds = roc_curve(classes_test, scores_test)
+                roc_auc = _trapz(tpr, fpr)
+                precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes_test, scores_test)
+                ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
-    return best_result
+                f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
+                best_threshold_index = np.argmax(f1_sweep)
+                best_threshold = prc_thresholds[best_threshold_index]
+                prec = precision_sweep[best_threshold_index]
+                rec = recall_sweep[best_threshold_index]
+                f1_val = f1_sweep[best_threshold_index]
+
+                key = approach
+                if key not in best_per_approach or roc_auc > best_per_approach[key]['roc_auc']:
+                    best_per_approach[key] = {
+                        'approach': approach,
+                        'weight_type': weight_type,
+                        'n_neighbours': n_neighbours,
+                        'roc_auc': roc_auc,
+                        'average_precision': ap,
+                        'threshold': best_threshold,
+                        'precision': prec,
+                        'recall': rec,
+                        'f1': f1_val,
+                    }
+            except Exception:
+                continue
+
+        results = list(best_per_approach.values())
+
+    return results if results else None
 
 
 # -------------------------
-# File parsing and distance logic
+# File parsing and feature extraction
 # -------------------------
 def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
     neighbourhood_classes = []
@@ -579,13 +678,41 @@ def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
         raise RuntimeError("Array lengths differs")
 
     n_neighbours = list(range(1, neighbourhood_limit + 1))
+
+    # Compute BOTH votes and distances
+    votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
     distances = get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
     return {
         "query_words": query_words,
         "query_word_classes": query_word_classes,
-        "distances": distances
+        "votes": votes,
+        "distances": distances,
     }
+
+
+def weighting_function(distances, weight_type='inverse', eps=1e-5):
+    if weight_type == 'inverse':
+        return 1 / (distances + eps)
+    elif weight_type == 'exponential':
+        return np.exp(-distances)
+    elif weight_type == 'constant':
+        return np.ones_like(distances)
+    else:
+        raise ValueError(f"Unknown weight type: {weight_type}")
+
+
+def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
+    votes = {}
+    for weight_type in ['constant', 'inverse', 'exponential']:
+        weight_type_votes = {}
+        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)
+        neighbour_weighted_classes = neighbour_weights * neighbourhood_classes
+        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)
+        for i in n_neighbours:
+            weight_type_votes[i] = neighbour_cumsums[:, i-1]
+        votes[weight_type] = weight_type_votes
+    return votes
 
 
 def get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours):
