@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import warnings
 from pathlib import Path
 import pickle
 from collections import defaultdict
 from hashlib import md5
 import multiprocessing
 import random
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import numpy as np
 from sklearn.metrics import roc_curve, precision_recall_curve, precision_score, recall_score, f1_score
@@ -15,6 +18,9 @@ from tqdm.auto import tqdm
 import h5py
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
+
+# Use np.trapezoid if available (numpy >= 2.0), else fall back to np.trapz
+_trapz = getattr(np, 'trapezoid', np.trapz)
 
 # -------------------------
 # Split generation helpers
@@ -60,12 +66,12 @@ def generate_and_save_split(master_list_path, output_json_path):
 # Dataset wrapper
 # -------------------------
 class NeighbourHoodDataset(Dataset):
-    def __init__(self, neighbourhoods_dir: Path):
-        self.neighbourhood_files = sorted(neighbourhoods_dir.glob("*.pkl"))
+    def __init__(self, neighbourhood_files, neighbourhood_limit=None):
+        self.neighbourhood_files = sorted(neighbourhood_files)
+        self.neighbourhood_limit = neighbourhood_limit
         neighbourhood_hash = md5()
         for neighbourhood_file in tqdm(self.neighbourhood_files, desc="Hashing neighbourhood files"):
             neighbourhood_hash.update(str(neighbourhood_file).encode('utf-8'))
-
         self.neighbourhood_hash = neighbourhood_hash.hexdigest()
         super().__init__()
 
@@ -74,7 +80,7 @@ class NeighbourHoodDataset(Dataset):
 
     def __getitem__(self, index):
         neighbourhood_file = self.neighbourhood_files[index]
-        neighbourhood = get_arrays_for_file(neighbourhood_file)
+        neighbourhood = get_arrays_for_file(neighbourhood_file, neighbourhood_limit=self.neighbourhood_limit)
         return neighbourhood
 
 
@@ -82,7 +88,7 @@ def no_tensor_collator(batch):
     return batch
 
 
-EVAL_METRICS = ('roc_auc', 'precision', 'recall', 'f1')
+EVAL_METRICS = ('roc_auc', 'precision', 'recall', 'f1', 'average_precision')
 
 
 # -------------------------
@@ -115,9 +121,16 @@ def main():
         return
 
     # --- Analysis mode ---
+    neighbourhood_files = sorted(args.neighbourhoods.glob("*.pkl"))
     output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
-    neighbours_dataset = NeighbourHoodDataset(args.neighbourhoods)
     output_dir.mkdir(exist_ok=True, parents=True)
+
+    neighbourhood_limit = get_neighbourhood_limit(neighbourhood_files, num_workers=args.num_workers)
+    if neighbourhood_limit is None or neighbourhood_limit < 0:
+        raise RuntimeError(f"Could not determine the neighbourhood limit, got {neighbourhood_limit}. "
+                           "This means that all neighbourhoods are empty, which is unexpected.")
+
+    neighbours_dataset = NeighbourHoodDataset(neighbourhood_files, neighbourhood_limit=neighbourhood_limit)
     votes_file = output_dir / f"neighbourhood_analysis_{neighbours_dataset.neighbourhood_hash}.h5"
 
     if args.recalculate or not votes_file.exists():
@@ -132,8 +145,8 @@ def main():
         with h5py.File(partial_file, 'w') as store:
             n_words = 0
             query_word_classes = []
-            query_word_lists = []   # NEW
-            votes = []
+            query_word_lists = []
+            distances = []
             for batch in tqdm(dataloader, desc="Reading neighbourhoods"):
                 for example in batch:
                     batch_query_words = example.get('query_words', [])
@@ -143,15 +156,15 @@ def main():
 
                     query_word_lists.append(batch_query_words)
                     query_word_classes.append(batch_query_word_classes)
-                    votes.append(example['votes'])
+                    distances.append(example['distances'])
 
                     if n_words >= args.chunk_size:
-                        n_words, query_word_classes, votes, query_word_lists = record_results(
-                            store, query_word_classes, votes, args.chunk_size, query_word_lists
+                        n_words, query_word_classes, distances, query_word_lists = record_results(
+                            store, query_word_classes, distances, args.chunk_size, query_word_lists
                         )
 
             # flush remaining
-            record_results(store, query_word_classes, votes, args.chunk_size, query_word_lists)
+            record_results(store, query_word_classes, distances, args.chunk_size, query_word_lists)
         partial_file.rename(votes_file)
 
     # If no splits-file provided -> standard analysis
@@ -173,7 +186,9 @@ def main():
                     plt.plot(n_neighbours, score, label=weight_type)
                 plt.xlabel("Number of Neighbours")
                 plt.ylabel(f"{eval_metric} Score")
-                plt.title(f"{eval_metric} vs Number of Neighbours (thresholded on {threshold_on})")
+                plt.title(f"{eval_metric} vs Number of Neighbours (thresholded on {threshold_on})\n"
+                          f"Positive: {threshold_df['positive_words'].iloc[0]}, "
+                          f"Negative: {threshold_df['negative_words'].iloc[0]}")
                 plt.legend()
                 plt.savefig(output_dir / f"{threshold_on}_{eval_metric}_vs_neighbours.png")
                 plt.close()
@@ -250,7 +265,7 @@ def main():
 # -------------------------
 # HDF5 record / compute helpers
 # -------------------------
-def record_results(store: h5py.File, query_word_classes, votes, chunk_size, query_word_lists):
+def record_results(store: h5py.File, query_word_classes, distances, chunk_size, query_word_lists):
     if len(query_word_classes) == 0:
         return 0, [], [], []
 
@@ -293,66 +308,65 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
         dsw.resize(new, axis=0)
         dsw[cur:new] = store_query_words_encoded
 
-    # flatten votes
-    flattened_votes = defaultdict(lambda: defaultdict(list))
-    for votes_batch in votes:
-        for weight_type, neighbour_votes in votes_batch.items():
-            for n, votes_array in neighbour_votes.items():
-                flattened_votes[weight_type][n].append(votes_array)
+    # flatten distances (structured like votes: centrality_measure -> n_neighbours -> array)
+    flattened_distances = defaultdict(lambda: defaultdict(list))
+    for dist_batch in distances:
+        for centrality_measure, neighbour_distances in dist_batch.items():
+            for n, dist_array in neighbour_distances.items():
+                flattened_distances[centrality_measure][n].append(dist_array)
 
-    remaining_votes_batch = {}
+    remaining_distances_batch = {}
     any_remaining = False
 
-    for weight_type, neighbour_votes in flattened_votes.items():
-        g = store.require_group(weight_type)
-        all_n_neighbours = set(int(n) for n in neighbour_votes.keys())
+    for centrality_measure, neighbour_distances in flattened_distances.items():
+        g = store.require_group(centrality_measure)
+        all_n_neighbours = set(int(n) for n in neighbour_distances.keys())
         if 'n_neighbours' in g.attrs:
             all_n_neighbours.update(g.attrs['n_neighbours'])
         g.attrs['n_neighbours'] = sorted(all_n_neighbours)
 
-        remaining_neighbour_votes = {}
-        for n_neighbours, votes_value in neighbour_votes.items():
-            concatenated_vote_values = np.concatenate(votes_value)
-            store_vote_values = concatenated_vote_values[:chunk_size]
-            remaining_vote_values_arr = concatenated_vote_values[chunk_size:]
+        remaining_neighbour_distances = {}
+        for n_neighbours, dist_value in neighbour_distances.items():
+            concatenated_dist_values = np.concatenate(dist_value)
+            store_dist_values = concatenated_dist_values[:chunk_size]
+            remaining_dist_values_arr = concatenated_dist_values[chunk_size:]
 
             if str(n_neighbours) not in g:
-                g.create_dataset(str(n_neighbours), data=store_vote_values, maxshape=(None,), chunks=(chunk_size,))
+                g.create_dataset(str(n_neighbours), data=store_dist_values, maxshape=(None,), chunks=(chunk_size,))
             else:
                 ds = g[str(n_neighbours)]
                 cur = ds.shape[0]
-                new = int(cur + store_vote_values.shape[0])
+                new = int(cur + store_dist_values.shape[0])
                 ds.resize(new, axis=0)
-                ds[cur:new] = store_vote_values
+                ds[cur:new] = store_dist_values
 
-            if len(remaining_vote_values_arr) != n_remaining:
-                raise RuntimeError("The remaining number of votes and number of remaining word classes differ")
+            if len(remaining_dist_values_arr) != n_remaining:
+                raise RuntimeError("The remaining number of distances and number of remaining word classes differ")
 
-            if len(remaining_vote_values_arr) > 0:
-                remaining_neighbour_votes[n_neighbours] = remaining_vote_values_arr
+            if len(remaining_dist_values_arr) > 0:
+                remaining_neighbour_distances[n_neighbours] = remaining_dist_values_arr
                 any_remaining = True
 
-        remaining_votes_batch[weight_type] = remaining_neighbour_votes
+        remaining_distances_batch[centrality_measure] = remaining_neighbour_distances
 
-    # FIX: Store the weighting function names as a root-level attribute
-    # so that compute_statistics / compute_statistics_with_split can find them.
-    all_weight_types = sorted(flattened_votes.keys())
-    if 'weighting_function' in store.attrs:
-        existing = set(store.attrs['weighting_function'])
-        existing.update(all_weight_types)
-        all_weight_types = sorted(existing)
-    store.attrs['weighting_function'] = all_weight_types
+    # Store centrality measure names as root-level attribute
+    all_measures = sorted(flattened_distances.keys())
+    if 'centrality_measures' in store.attrs:
+        existing = set(store.attrs['centrality_measures'])
+        existing.update(all_measures)
+        all_measures = sorted(existing)
+    store.attrs['centrality_measures'] = all_measures
 
-    remaining_votes = [remaining_votes_batch] if any_remaining else []
+    remaining_distances = [remaining_distances_batch] if any_remaining else []
 
-    return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
+    return n_remaining, remaining_word_classes, remaining_distances, remaining_query_words
 
 
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
-        weighting_functions = store.attrs['weighting_function']
-        for weight_type in weighting_functions:
+        centrality_measures = store.attrs['centrality_measures']
+        for weight_type in centrality_measures:
             g = store[weight_type]
             all_n_neighbours = g.attrs['n_neighbours']
             for n_neighbours in all_n_neighbours:
@@ -374,9 +388,12 @@ def statistics_worker(work_package):
     records = []
     with h5py.File(store_file) as store:
         query_word_classes = store['query_word_classes'][:]
-        votes = store[weight_type][str(n_neighbours)][:]
+        positive_words = int(np.sum(query_word_classes))
+        negative_words = len(query_word_classes) - positive_words
+        # Transform distances to similarity scores: smaller distance -> higher score
+        votes = np.exp(-store[weight_type][str(n_neighbours)][:])
         fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
-        roc_auc = np.trapz(tpr, fpr)
+        roc_auc = _trapz(tpr, fpr)
         precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
         ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
@@ -389,6 +406,8 @@ def statistics_worker(work_package):
         recall = recall_score(query_word_classes, discretized_votes)
         performance_record_ba = {'weight_type': weight_type,
                                  'n_neighbours': n_neighbours,
+                                 'positive_words': positive_words,
+                                 'negative_words': negative_words,
                                  'roc_auc': roc_auc,
                                  'average_precision': ap,
                                  'threshold': best_threshold,
@@ -407,6 +426,8 @@ def statistics_worker(work_package):
         f1 = f1_sweep[best_threshold_index]
         performance_record_f1 = {'weight_type': weight_type,
                                  'n_neighbours': n_neighbours,
+                                 'positive_words': positive_words,
+                                 'negative_words': negative_words,
                                  'roc_auc': roc_auc,
                                  'average_precision': ap,
                                  'threshold': best_threshold,
@@ -434,20 +455,22 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if not test_mask.any():
             return None
 
-        weighting_functions = store.attrs['weighting_function']
+        centrality_measures = store.attrs['centrality_measures']
 
-        for weight_type in weighting_functions:
+        for weight_type in centrality_measures:
             g = store[weight_type]
             all_n_neighbours = g.attrs['n_neighbours']
             for n_neighbours in all_n_neighbours:
-                votes = g[str(n_neighbours)][:]
+                raw_distances = g[str(n_neighbours)][:]
+                # Transform distances to similarity scores
+                votes = np.exp(-raw_distances)
 
                 votes_test = votes[test_mask]
                 classes_test = query_word_classes[test_mask]
 
                 try:
                     fpr, tpr, roc_thresholds = roc_curve(classes_test, votes_test)
-                    roc_auc = np.trapz(tpr, fpr)
+                    roc_auc = _trapz(tpr, fpr)
                     precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes_test, votes_test)
                     ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
 
@@ -477,13 +500,13 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
 
 
 # -------------------------
-# File parsing and vote logic
+# File parsing and distance logic
 # -------------------------
-def get_arrays_for_file(neighbourhood_file):
+def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
     neighbourhood_classes = []
     neighbourhood_distances = []
     query_word_classes = []
-    max_neighbours = 0
+
     with open(neighbourhood_file, 'rb') as fp:
         neighbourhood_data = pickle.load(fp)
         neighbourhoods = neighbourhood_data["neighbourhoods"]
@@ -496,7 +519,6 @@ def get_arrays_for_file(neighbourhood_file):
         if query_label in skip_labels:
             continue
 
-        max_neighbours = max(max_neighbours, len(neighbours))
         query_neighbour_classes = []
         query_distances = []
         for cossim, neighbour_word, neighbour_label in neighbours:
@@ -508,46 +530,60 @@ def get_arrays_for_file(neighbourhood_file):
             neighbourhood_distances.append(query_distances)
             query_words.append(query_word)
 
-    neighbourhood_classes = np.array(neighbourhood_classes, dtype=np.int8)
-    neighbourhood_distances = np.array(neighbourhood_distances, dtype=np.float32)
+    neighbourhood_classes = np.array([nc[:neighbourhood_limit] for nc in neighbourhood_classes], dtype=np.int8)
+    neighbourhood_distances = np.array([nd[:neighbourhood_limit] for nd in neighbourhood_distances], dtype=np.float32)
     query_word_classes = np.array(query_word_classes, dtype=np.int8)
     if (len(query_word_classes) != len(neighbourhood_classes)
         or len(neighbourhood_distances) != len(query_word_classes)
         or len(neighbourhood_distances) != len(neighbourhood_classes)):
         raise RuntimeError("Array lengths differs")
 
-    n_neighbours = list(range(1, max_neighbours+1))
-    votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
+    n_neighbours = list(range(1, neighbourhood_limit + 1))
+    distances = get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
     return {
         "query_words": query_words,
         "query_word_classes": query_word_classes,
-        "votes": votes
+        "distances": distances
     }
 
 
-def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
-    votes = {}
-    for weight_type in ['constant', 'inverse', 'exponential']:
-        weight_type_votes = {}
-        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)
-        neighbour_weighted_classes = neighbour_weights * neighbourhood_classes
-        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)
+def get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours):
+    distances = {}
+    for measure, measure_fun in [('mean', np.mean), ('median', np.median)]:
+        distance_per_neighbourhood = {}
         for i in n_neighbours:
-            weight_type_votes[i] = neighbour_cumsums[:, i-1]
-        votes[weight_type] = weight_type_votes
-    return votes
+            distance_per_neighbourhood[i] = measure_fun(neighbourhood_distances[:, :i], axis=1)
+        distances[measure] = distance_per_neighbourhood
+    return distances
 
 
-def weighting_function(distances, weight_type='inverse', eps=1e-5):
-    if weight_type == 'inverse':
-        return 1 / (distances + eps)
-    elif weight_type == 'exponential':
-        return np.exp(-distances)
-    elif weight_type == 'constant':
-        return np.ones_like(distances)
+def get_min_neighbours_for_file(neighbourhood_file):
+    min_neighbours = None
+    with open(neighbourhood_file, 'rb') as fp:
+        neighbourhood_data = pickle.load(fp)
+        neighbourhoods = neighbourhood_data["neighbourhoods"]
+        for (query_word, query_label), neighbours in neighbourhoods:
+            n_neighbours_for_word = len(neighbours)
+            if n_neighbours_for_word > 0 and (min_neighbours is None or n_neighbours_for_word < min_neighbours):
+                min_neighbours = n_neighbours_for_word
+    return min_neighbours
+
+
+def get_neighbourhood_limit(neighbourhood_files, num_workers=0):
+    min_neighbours = None
+    if num_workers > 1:
+        with multiprocessing.Pool(num_workers) as pool:
+            for file_min_neighbours in tqdm(pool.imap_unordered(get_min_neighbours_for_file, neighbourhood_files),
+                                            total=len(neighbourhood_files), desc="Finding neighbourhood limit"):
+                if file_min_neighbours is not None and (min_neighbours is None or file_min_neighbours < min_neighbours):
+                    min_neighbours = file_min_neighbours
     else:
-        raise ValueError(f"Unknown weight type: {weight_type}")
+        for file_min_neighbours in tqdm(map(get_min_neighbours_for_file, neighbourhood_files),
+                                        total=len(neighbourhood_files), desc="Finding neighbourhood limit"):
+            if file_min_neighbours is not None and (min_neighbours is None or file_min_neighbours < min_neighbours):
+                min_neighbours = file_min_neighbours
+    return min_neighbours
 
 
 if __name__ == "__main__":
