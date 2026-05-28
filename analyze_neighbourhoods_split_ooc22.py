@@ -1,3 +1,6 @@
+cd /home/abragam23/src/aimplant/aimplant_demonstrator
+cp implant/analyze_neighbourhoods_split_ooc22.py analyze_neighbourhoods_split_ooc22.py
+python analyze_neighbourhoods_split_ooc22.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --splits-file /home/abragam23/fedhealth_data/implant_split.json --recalculate
 #!/usr/bin/env python3
 import argparse
 import json
