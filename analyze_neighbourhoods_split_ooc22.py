@@ -228,8 +228,14 @@ def main():
 
             agg_results = {}
             for col in available_cols:
-                agg_results[f"{col}_mean"] = results_df[col].mean()
-                agg_results[f"{col}_std"] = results_df[col].std()
+                values = results_df[col].dropna().values
+                agg_results[f"{col}_mean"] = np.mean(values)
+                agg_results[f"{col}_std"] = np.std(values, ddof=1)
+                agg_results[f"{col}_median"] = np.median(values)
+                # Bootstrapped 95% CI of the mean
+                ci_lo, ci_hi = bootstrap_ci(values, n_bootstrap=10000)
+                agg_results[f"{col}_ci95_lo"] = ci_lo
+                agg_results[f"{col}_ci95_hi"] = ci_hi
 
             agg_df = pd.DataFrame([agg_results])
             agg_file = output_dir / "aggregated_split_results.csv"
@@ -239,9 +245,14 @@ def main():
             print("AGGREGATED RESULTS ACROSS ALL SPLITS")
             print("="*60)
             for col in available_cols:
-                mean_val = results_df[col].mean()
-                std_val = results_df[col].std()
-                print(f"  {col:>20s}: {mean_val:.4f} ± {std_val:.4f}")
+                values = results_df[col].dropna().values
+                mean_val = np.mean(values)
+                std_val = np.std(values, ddof=1)
+                median_val = np.median(values)
+                ci_lo = agg_results[f"{col}_ci95_lo"]
+                ci_hi = agg_results[f"{col}_ci95_hi"]
+                print(f"  {col:>20s}: mean={mean_val:.4f} ± {std_val:.4f}  "
+                      f"median={median_val:.4f}  95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
             print("="*60)
 
             for metric in available_cols:
@@ -261,6 +272,16 @@ def main():
             print(f"\nDistribution plots saved to: {output_dir}")
         else:
             print("WARNING: No split results were computed. Check your splits file and data.")
+
+def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
+    rng = np.random.RandomState(seed)
+    n = len(values)
+    if n == 0:
+        return np.nan, np.nan
+    boot_means = np.array([np.mean(rng.choice(values, size=n, replace=True)) for _ in range(n_bootstrap)])
+    alpha = (1 - ci) / 2
+    return np.percentile(boot_means, 100 * alpha), np.percentile(boot_means, 100 * (1 - alpha))
+
 
 # -------------------------
 # HDF5 record / compute helpers
