@@ -241,9 +241,28 @@ def main():
             agg_file = output_dir / "aggregated_split_results.csv"
             agg_df.to_csv(agg_file, index=False)
 
-            print("\n" + "="*60)
+            # Print per-split details for key metrics
+            print("\n" + "="*70)
+            print("PER-SPLIT RESULTS (roc_auc, precision, average_precision)")
+            print("="*70)
+            print(f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
+                  f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
+                  f"{'Recall':>7s}  {'F1':>7s}")
+            print("-"*70)
+            for _, row in results_df.iterrows():
+                print(f"{int(row['split_id']):>6d}  "
+                      f"{row['weight_type']:>12s}  "
+                      f"{int(row['n_neighbours']):>7d}  "
+                      f"{row['roc_auc']:>8.4f}  "
+                      f"{row['precision']:>9.4f}  "
+                      f"{row['average_precision']:>8.4f}  "
+                      f"{row.get('recall', float('nan')):>7.4f}  "
+                      f"{row.get('f1', float('nan')):>7.4f}")
+            print("-"*70)
+
+            print("\n" + "="*70)
             print("AGGREGATED RESULTS ACROSS ALL SPLITS")
-            print("="*60)
+            print("="*70)
             for col in available_cols:
                 values = results_df[col].dropna().values
                 mean_val = np.mean(values)
@@ -253,7 +272,7 @@ def main():
                 ci_hi = agg_results[f"{col}_ci95_hi"]
                 print(f"  {col:>20s}: mean={mean_val:.4f} ± {std_val:.4f}  "
                       f"median={median_val:.4f}  95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
-            print("="*60)
+            print("="*70)
 
             for metric in available_cols:
                 if metric == 'threshold':
