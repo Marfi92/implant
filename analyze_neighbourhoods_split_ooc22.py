@@ -202,24 +202,85 @@ def main():
             splits = json.load(fp)
         print(f"Loaded {len(splits)} splits")
 
+        # ---- Print split summary info ----
+        split_sizes = {'ref': [], 'dev': [], 'test': []}
+        for split_id, split_data in splits.items():
+            for key in ('ref', 'dev', 'test'):
+                split_sizes[key].append(len(split_data[key]))
+        print(f"\n{'='*70}")
+        print(f"SPLIT FILE SUMMARY")
+        print(f"{'='*70}")
+        for key in ('ref', 'dev', 'test'):
+            vals = split_sizes[key]
+            print(f"  {key:>5s}: min={min(vals):>6d}  max={max(vals):>6d}  "
+                  f"mean={np.mean(vals):>8.1f}  (across {len(vals)} splits)")
+        print(f"{'='*70}")
+
         all_split_results = []
+        all_split_info = []
         for split_id, split_data in tqdm(splits.items(), desc="Evaluating splits"):
             ref_words = set(split_data["ref"])
             dev_words = set(split_data["dev"])
             test_words = set(split_data["test"])
 
-            split_results = compute_statistics_with_split(
+            split_results, split_info = compute_statistics_with_split(
                 votes_file,
                 ref_words=ref_words,
                 dev_words=dev_words,
                 test_words=test_words,
+                split_id=int(split_id),
                 num_workers=args.num_workers
             )
+
+            all_split_info.append(split_info)
 
             if split_results:
                 for result in split_results:
                     result['split_id'] = int(split_id)
                 all_split_results.extend(split_results)
+
+        # ---- Print split diagnostic info ----
+        if all_split_info:
+            info_df = pd.DataFrame(all_split_info)
+            split_info_file = output_dir / "split_info.csv"
+            info_df.to_csv(split_info_file, index=False)
+
+            print(f"\n{'='*70}")
+            print(f"SPLIT DIAGNOSTIC INFO (how splits map to data)")
+            print(f"{'='*70}")
+            if len(info_df) > 0 and 'total_words_in_data' in info_df.columns:
+                first = info_df.iloc[0]
+                print(f"  Total words in HDF5 data: {int(first['total_words_in_data'])}")
+                print(f"  Total positive (class=1): {int(first['total_positive_in_data'])}")
+                print(f"  Total negative (class=0): {int(first['total_negative_in_data'])}")
+                if first['total_words_in_data'] > 0:
+                    print(f"  Overall positive rate:    {first['total_positive_in_data']/first['total_words_in_data']:.4%}")
+
+            print(f"\n  Per-split test set statistics (across {len(info_df)} splits):")
+            for col, label in [('test_matched', 'Test words matched'),
+                               ('test_positive', 'Test positives'),
+                               ('test_negative', 'Test negatives'),
+                               ('test_positive_rate', 'Test positive rate')]:
+                if col in info_df.columns:
+                    vals = info_df[col].values
+                    fmt = '.4f' if 'rate' in col else '.1f'
+                    print(f"    {label:>25s}: min={np.min(vals):{fmt}}  max={np.max(vals):{fmt}}  "
+                          f"mean={np.mean(vals):{fmt}}  median={np.median(vals):{fmt}}")
+
+            print(f"\n  Per-split ref/dev set statistics:")
+            for col, label in [('ref_matched', 'Ref words matched'),
+                               ('ref_positive', 'Ref positives'),
+                               ('ref_negative', 'Ref negatives'),
+                               ('dev_matched', 'Dev words matched'),
+                               ('dev_positive', 'Dev positives'),
+                               ('dev_negative', 'Dev negatives')]:
+                if col in info_df.columns:
+                    vals = info_df[col].values
+                    print(f"    {label:>25s}: min={np.min(vals):>6.0f}  max={np.max(vals):>6.0f}  "
+                          f"mean={np.mean(vals):>8.1f}  median={np.median(vals):>8.1f}")
+
+            print(f"\n  Split info saved to: {split_info_file}")
+            print(f"{'='*70}")
 
         if all_split_results:
             results_df = pd.DataFrame(all_split_results)
@@ -228,7 +289,7 @@ def main():
             print(f"\nPer-split results saved to: {per_split_file}")
 
             # Print results grouped by approach
-            for approach in results_df['approach'].unique():
+            for approach in sorted(results_df['approach'].unique()):
                 approach_df = results_df[results_df['approach'] == approach]
                 print(f"\n{'='*70}")
                 print(f"APPROACH: {approach}")
@@ -237,9 +298,11 @@ def main():
                 # Per-split table
                 print(f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
                       f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
-                      f"{'Recall':>7s}  {'F1':>7s}")
-                print("-"*70)
-                for _, row in approach_df.iterrows():
+                      f"{'Recall':>7s}  {'F1':>7s}  "
+                      f"{'TestPos':>7s}  {'TestNeg':>7s}  "
+                      f"{'ScPos_mu':>8s}  {'ScNeg_mu':>8s}")
+                print("-"*120)
+                for _, row in approach_df.sort_values('split_id').iterrows():
                     print(f"{int(row['split_id']):>6d}  "
                           f"{row['weight_type']:>12s}  "
                           f"{int(row['n_neighbours']):>7d}  "
@@ -247,10 +310,14 @@ def main():
                           f"{row['precision']:>9.4f}  "
                           f"{row['average_precision']:>8.4f}  "
                           f"{row.get('recall', float('nan')):>7.4f}  "
-                          f"{row.get('f1', float('nan')):>7.4f}")
-                print("-"*70)
+                          f"{row.get('f1', float('nan')):>7.4f}  "
+                          f"{int(row.get('test_n_positive', 0)):>7d}  "
+                          f"{int(row.get('test_n_negative', 0)):>7d}  "
+                          f"{row.get('score_pos_mean', float('nan')):>8.4f}  "
+                          f"{row.get('score_neg_mean', float('nan')):>8.4f}")
+                print("-"*120)
 
-                # Aggregated stats
+                # Aggregated stats with min/max
                 numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
                 available_cols = [c for c in numeric_cols if c in approach_df.columns]
 
@@ -260,13 +327,28 @@ def main():
                     mean_val = np.mean(values)
                     std_val = np.std(values, ddof=1)
                     median_val = np.median(values)
+                    min_val = np.min(values)
+                    max_val = np.max(values)
                     ci_lo, ci_hi = bootstrap_ci(values)
                     print(f"    {col:>20s}: mean={mean_val:.4f} ± {std_val:.4f}  "
-                          f"median={median_val:.4f}  95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
+                          f"median={median_val:.4f}  min={min_val:.4f}  max={max_val:.4f}  "
+                          f"95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]")
+
+                # Score separation diagnostics
+                if 'score_pos_mean' in approach_df.columns:
+                    pos_means = approach_df['score_pos_mean'].dropna().values
+                    neg_means = approach_df['score_neg_mean'].dropna().values
+                    if len(pos_means) > 0 and len(neg_means) > 0:
+                        sep = pos_means - neg_means
+                        print(f"\n  SCORE SEPARATION ({approach}):")
+                        print(f"    Positive class score mean: {np.mean(pos_means):.6f} ± {np.std(pos_means):.6f}")
+                        print(f"    Negative class score mean: {np.mean(neg_means):.6f} ± {np.std(neg_means):.6f}")
+                        print(f"    Mean separation (pos-neg): {np.mean(sep):.6f} ± {np.std(sep):.6f}")
+                        print(f"    Separation range:          [{np.min(sep):.6f}, {np.max(sep):.6f}]")
 
             # Save aggregated results for all approaches
             agg_rows = []
-            for approach in results_df['approach'].unique():
+            for approach in sorted(results_df['approach'].unique()):
                 approach_df = results_df[results_df['approach'] == approach]
                 numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
                 available_cols = [c for c in numeric_cols if c in approach_df.columns]
@@ -276,6 +358,8 @@ def main():
                     agg_row[f"{col}_mean"] = np.mean(values)
                     agg_row[f"{col}_std"] = np.std(values, ddof=1)
                     agg_row[f"{col}_median"] = np.median(values)
+                    agg_row[f"{col}_min"] = np.min(values)
+                    agg_row[f"{col}_max"] = np.max(values)
                     ci_lo, ci_hi = bootstrap_ci(values)
                     agg_row[f"{col}_ci95_lo"] = ci_lo
                     agg_row[f"{col}_ci95_hi"] = ci_hi
@@ -285,7 +369,7 @@ def main():
             agg_df.to_csv(agg_file, index=False)
 
             # Distribution plots per approach
-            for approach in results_df['approach'].unique():
+            for approach in sorted(results_df['approach'].unique()):
                 approach_df = results_df[results_df['approach'] == approach]
                 for metric in ['roc_auc', 'precision', 'recall', 'f1', 'average_precision']:
                     if metric not in approach_df.columns:
@@ -293,7 +377,6 @@ def main():
                     plt.figure(figsize=(8, 5))
                     plt.hist(approach_df[metric], bins=20, edgecolor='black', alpha=0.7)
                     mean_val = approach_df[metric].mean()
-                    plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
                     plt.xlabel(metric)
                     plt.ylabel("Count")
                     plt.title(f"Distribution of {metric} ({approach})\n"
@@ -564,19 +647,50 @@ def statistics_worker(work_package):
 # -------------------------
 # Split-based evaluation helper
 # -------------------------
-def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, num_workers=0):
+def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, split_id=None, num_workers=0):
     results = []
+    split_info = {}
 
     with h5py.File(votes_file, 'r') as store:
         query_word_classes = store['query_word_classes'][:]
         raw_qwords = store['query_words'][:]
         query_words = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
 
+        # Build masks for ref/dev/test
+        ref_mask = np.array([w in ref_words for w in query_words], dtype=bool)
+        dev_mask = np.array([w in dev_words for w in query_words], dtype=bool)
         test_mask = np.array([w in test_words for w in query_words], dtype=bool)
-        if not test_mask.any():
-            return None
 
-        classes_test = query_word_classes[test_mask]
+        # Collect split info
+        classes_ref = query_word_classes[ref_mask] if ref_mask.any() else np.array([])
+        classes_dev = query_word_classes[dev_mask] if dev_mask.any() else np.array([])
+        classes_test = query_word_classes[test_mask] if test_mask.any() else np.array([])
+
+        split_info = {
+            'split_id': split_id,
+            'total_words_in_data': len(query_words),
+            'total_positive_in_data': int(np.sum(query_word_classes)),
+            'total_negative_in_data': int(len(query_word_classes) - np.sum(query_word_classes)),
+            'ref_n_words': int(len(ref_words)),
+            'ref_matched': int(ref_mask.sum()),
+            'ref_positive': int(np.sum(classes_ref)) if len(classes_ref) > 0 else 0,
+            'ref_negative': int(len(classes_ref) - np.sum(classes_ref)) if len(classes_ref) > 0 else 0,
+            'dev_n_words': int(len(dev_words)),
+            'dev_matched': int(dev_mask.sum()),
+            'dev_positive': int(np.sum(classes_dev)) if len(classes_dev) > 0 else 0,
+            'dev_negative': int(len(classes_dev) - np.sum(classes_dev)) if len(classes_dev) > 0 else 0,
+            'test_n_words': int(len(test_words)),
+            'test_matched': int(test_mask.sum()),
+            'test_positive': int(np.sum(classes_test)) if len(classes_test) > 0 else 0,
+            'test_negative': int(len(classes_test) - np.sum(classes_test)) if len(classes_test) > 0 else 0,
+        }
+        if len(classes_test) > 0:
+            split_info['test_positive_rate'] = float(np.sum(classes_test)) / len(classes_test)
+        else:
+            split_info['test_positive_rate'] = 0.0
+
+        if not test_mask.any():
+            return None, split_info
 
         # Evaluate both approaches
         approach_configs = []
@@ -604,6 +718,10 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
 
             scores_test = scores[test_mask]
 
+            # Score diagnostics per config
+            pos_scores = scores_test[classes_test == 1]
+            neg_scores = scores_test[classes_test == 0]
+
             try:
                 fpr, tpr, roc_thresholds = roc_curve(classes_test, scores_test)
                 roc_auc = _trapz(tpr, fpr)
@@ -629,13 +747,19 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                         'precision': prec,
                         'recall': rec,
                         'f1': f1_val,
+                        'test_n_positive': int(len(pos_scores)),
+                        'test_n_negative': int(len(neg_scores)),
+                        'score_pos_mean': float(np.mean(pos_scores)) if len(pos_scores) > 0 else float('nan'),
+                        'score_neg_mean': float(np.mean(neg_scores)) if len(neg_scores) > 0 else float('nan'),
+                        'score_pos_std': float(np.std(pos_scores)) if len(pos_scores) > 0 else float('nan'),
+                        'score_neg_std': float(np.std(neg_scores)) if len(neg_scores) > 0 else float('nan'),
                     }
             except Exception:
                 continue
 
         results = list(best_per_approach.values())
 
-    return results if results else None
+    return (results if results else None), split_info
 
 
 # -------------------------
@@ -679,7 +803,7 @@ def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
 
     n_neighbours = list(range(1, neighbourhood_limit + 1))
 
-    # Compute BOTH votes and distances
+    # Compute ALL approaches: votes (raw + normalized) and distances
     votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
     distances = get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
@@ -712,6 +836,14 @@ def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
         for i in n_neighbours:
             weight_type_votes[i] = neighbour_cumsums[:, i-1]
         votes[weight_type] = weight_type_votes
+
+        # Normalized variant: divide weighted positive votes by total weight sum -> [0,1] probability
+        norm_key = f"{weight_type}_norm"
+        norm_votes = {}
+        weight_cumsums = np.cumsum(neighbour_weights, axis=1)
+        for i in n_neighbours:
+            norm_votes[i] = neighbour_cumsums[:, i-1] / (weight_cumsums[:, i-1] + 1e-12)
+        votes[norm_key] = norm_votes
     return votes
 
 
