@@ -1,4 +1,3 @@
-python analyze_neighbourhoods_split_ooc22.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --splits-file /home/abragam23/fedhealth_data/implant_split.json --recalculate
 #!/usr/bin/env python3
 import argparse
 import json
@@ -11,6 +10,7 @@ import multiprocessing
 import random
  
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
  
 import numpy as np
 from sklearn.metrics import roc_curve, precision_recall_curve, precision_score, recall_score, f1_score
@@ -297,30 +297,37 @@ def main():
                 print(f"{'='*70}")
  
                 # Per-split table
-                print(f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
-                      f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
-                      f"{'Recall':>7s}  {'F1':>7s}  "
-                      f"{'TestPos':>7s}  {'TestNeg':>7s}  "
-                      f"{'ScPos_mu':>8s}  {'ScNeg_mu':>8s}")
-                print("-"*120)
+                has_dev_auc = 'dev_roc_auc' in approach_df.columns and approach_df['dev_roc_auc'].notna().any()
+                header = (f"{'Split':>6s}  {'Weight':>12s}  {'n_neigh':>7s}  "
+                          f"{'ROC_AUC':>8s}  {'Precision':>9s}  {'Avg_Prec':>8s}  "
+                          f"{'Recall':>7s}  {'F1':>7s}  "
+                          f"{'TestPos':>7s}  {'TestNeg':>7s}  "
+                          f"{'ScPos_mu':>8s}  {'ScNeg_mu':>8s}")
+                if has_dev_auc:
+                    header += f"  {'DevAUC':>8s}"
+                print(header)
+                print("-"*130)
                 for _, row in approach_df.sort_values('split_id').iterrows():
-                    print(f"{int(row['split_id']):>6d}  "
-                          f"{row['weight_type']:>12s}  "
-                          f"{int(row['n_neighbours']):>7d}  "
-                          f"{row['roc_auc']:>8.4f}  "
-                          f"{row['precision']:>9.4f}  "
-                          f"{row['average_precision']:>8.4f}  "
-                          f"{row.get('recall', float('nan')):>7.4f}  "
-                          f"{row.get('f1', float('nan')):>7.4f}  "
-                          f"{int(row.get('test_n_positive', 0)):>7d}  "
-                          f"{int(row.get('test_n_negative', 0)):>7d}  "
-                          f"{row.get('score_pos_mean', float('nan')):>8.4f}  "
-                          f"{row.get('score_neg_mean', float('nan')):>8.4f}")
-                print("-"*120)
+                    line = (f"{int(row['split_id']):>6d}  "
+                            f"{row['weight_type']:>12s}  "
+                            f"{int(row['n_neighbours']):>7d}  "
+                            f"{row['roc_auc']:>8.4f}  "
+                            f"{row['precision']:>9.4f}  "
+                            f"{row['average_precision']:>8.4f}  "
+                            f"{row.get('recall', float('nan')):>7.4f}  "
+                            f"{row.get('f1', float('nan')):>7.4f}  "
+                            f"{int(row.get('test_n_positive', 0)):>7d}  "
+                            f"{int(row.get('test_n_negative', 0)):>7d}  "
+                            f"{row.get('score_pos_mean', float('nan')):>8.4f}  "
+                            f"{row.get('score_neg_mean', float('nan')):>8.4f}")
+                    if has_dev_auc:
+                        line += f"  {row.get('dev_roc_auc', float('nan')):>8.4f}"
+                    print(line)
+                print("-"*130)
  
                 # Aggregated stats with min/max
-                numeric_cols = ['roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
-                available_cols = [c for c in numeric_cols if c in approach_df.columns]
+                numeric_cols = ['roc_auc', 'dev_roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
+                available_cols = [c for c in numeric_cols if c in approach_df.columns and approach_df[c].notna().any()]
  
                 print(f"\n  AGGREGATED ({approach}):")
                 for col in available_cols:
@@ -648,6 +655,43 @@ def statistics_worker(work_package):
 # -------------------------
 # Split-based evaluation helper
 # -------------------------
+def _evaluate_config_on_subset(store, approach, weight_type, n_neighbours, mask, classes):
+    """Evaluate a single (approach, weight_type, n_neighbours) config on a data subset."""
+    raw_scores = store[approach][weight_type][str(n_neighbours)][:]
+    if approach == 'distances':
+        scores = np.exp(-raw_scores)
+    else:
+        scores = raw_scores
+ 
+    scores_sub = scores[mask]
+    pos_scores = scores_sub[classes == 1]
+    neg_scores = scores_sub[classes == 0]
+ 
+    fpr, tpr, roc_thresholds = roc_curve(classes, scores_sub)
+    roc_auc = _trapz(tpr, fpr)
+    precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes, scores_sub)
+    ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
+ 
+    f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
+    best_f1_idx = np.argmax(f1_sweep)
+    best_threshold = prc_thresholds[best_f1_idx]
+    prec = precision_sweep[best_f1_idx]
+    rec = recall_sweep[best_f1_idx]
+    f1_val = f1_sweep[best_f1_idx]
+ 
+    return {
+        'roc_auc': roc_auc,
+        'average_precision': ap,
+        'threshold': best_threshold,
+        'precision': prec,
+        'recall': rec,
+        'f1': f1_val,
+        'scores_sub': scores_sub,
+        'pos_scores': pos_scores,
+        'neg_scores': neg_scores,
+    }
+ 
+ 
 def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, split_id=None, num_workers=0):
     results = []
     split_info = {}
@@ -693,7 +737,7 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if not test_mask.any():
             return None, split_info
  
-        # Evaluate both approaches
+        # Collect all approach configs
         approach_configs = []
         if 'votes' in store:
             vg = store['votes']
@@ -708,55 +752,93 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                 for nn in g.attrs['n_neighbours']:
                     approach_configs.append(('distances', cm, nn))
  
-        best_per_approach = {}  # approach -> best result dict
+        # ---- STAGE 1: Select best config per approach using DEV set ----
+        best_dev_config = {}  # approach -> (weight_type, n_neighbours, dev_auc, dev_threshold)
+        use_dev = dev_mask.any() and len(classes_dev) > 0 and len(np.unique(classes_dev)) > 1
  
-        for approach, weight_type, n_neighbours in approach_configs:
-            raw_scores = store[approach][weight_type][str(n_neighbours)][:]
-            if approach == 'distances':
-                scores = np.exp(-raw_scores)
-            else:
-                scores = raw_scores
+        if use_dev:
+            for approach, weight_type, n_neighbours in approach_configs:
+                try:
+                    dev_result = _evaluate_config_on_subset(
+                        store, approach, weight_type, n_neighbours, dev_mask, classes_dev
+                    )
+                    key = approach
+                    if key not in best_dev_config or dev_result['roc_auc'] > best_dev_config[key][2]:
+                        best_dev_config[key] = (weight_type, n_neighbours, dev_result['roc_auc'], dev_result['threshold'])
+                except Exception:
+                    continue
  
-            scores_test = scores[test_mask]
+        # ---- STAGE 2: Evaluate best config on TEST set ----
+        best_per_approach = {}
  
-            # Score diagnostics per config
-            pos_scores = scores_test[classes_test == 1]
-            neg_scores = scores_test[classes_test == 0]
+        if use_dev and best_dev_config:
+            # Proper two-stage: use dev-selected config, apply dev threshold to test
+            for approach, (best_wt, best_nn, dev_auc, dev_threshold) in best_dev_config.items():
+                try:
+                    test_result = _evaluate_config_on_subset(
+                        store, approach, best_wt, best_nn, test_mask, classes_test
+                    )
+                    # Also compute precision/recall/f1 using the dev-optimized threshold
+                    scores_test = test_result['scores_sub']
+                    dev_discretized = scores_test > dev_threshold
+                    if dev_discretized.any() and not dev_discretized.all():
+                        dev_prec = precision_score(classes_test, dev_discretized, zero_division=0)
+                        dev_rec = recall_score(classes_test, dev_discretized, zero_division=0)
+                        dev_f1 = f1_score(classes_test, dev_discretized, zero_division=0)
+                    else:
+                        dev_prec = test_result['precision']
+                        dev_rec = test_result['recall']
+                        dev_f1 = test_result['f1']
  
-            try:
-                fpr, tpr, roc_thresholds = roc_curve(classes_test, scores_test)
-                roc_auc = _trapz(tpr, fpr)
-                precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(classes_test, scores_test)
-                ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
- 
-                f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
-                best_threshold_index = np.argmax(f1_sweep)
-                best_threshold = prc_thresholds[best_threshold_index]
-                prec = precision_sweep[best_threshold_index]
-                rec = recall_sweep[best_threshold_index]
-                f1_val = f1_sweep[best_threshold_index]
- 
-                key = approach
-                if key not in best_per_approach or roc_auc > best_per_approach[key]['roc_auc']:
-                    best_per_approach[key] = {
+                    best_per_approach[approach] = {
                         'approach': approach,
-                        'weight_type': weight_type,
-                        'n_neighbours': n_neighbours,
-                        'roc_auc': roc_auc,
-                        'average_precision': ap,
-                        'threshold': best_threshold,
-                        'precision': prec,
-                        'recall': rec,
-                        'f1': f1_val,
-                        'test_n_positive': int(len(pos_scores)),
-                        'test_n_negative': int(len(neg_scores)),
-                        'score_pos_mean': float(np.mean(pos_scores)) if len(pos_scores) > 0 else float('nan'),
-                        'score_neg_mean': float(np.mean(neg_scores)) if len(neg_scores) > 0 else float('nan'),
-                        'score_pos_std': float(np.std(pos_scores)) if len(pos_scores) > 0 else float('nan'),
-                        'score_neg_std': float(np.std(neg_scores)) if len(neg_scores) > 0 else float('nan'),
+                        'weight_type': best_wt,
+                        'n_neighbours': best_nn,
+                        'roc_auc': test_result['roc_auc'],
+                        'average_precision': test_result['average_precision'],
+                        'threshold': dev_threshold,
+                        'precision': dev_prec,
+                        'recall': dev_rec,
+                        'f1': dev_f1,
+                        'dev_roc_auc': dev_auc,
+                        'test_n_positive': int(len(test_result['pos_scores'])),
+                        'test_n_negative': int(len(test_result['neg_scores'])),
+                        'score_pos_mean': float(np.mean(test_result['pos_scores'])) if len(test_result['pos_scores']) > 0 else float('nan'),
+                        'score_neg_mean': float(np.mean(test_result['neg_scores'])) if len(test_result['neg_scores']) > 0 else float('nan'),
+                        'score_pos_std': float(np.std(test_result['pos_scores'])) if len(test_result['pos_scores']) > 0 else float('nan'),
+                        'score_neg_std': float(np.std(test_result['neg_scores'])) if len(test_result['neg_scores']) > 0 else float('nan'),
                     }
-            except Exception:
-                continue
+                except Exception:
+                    continue
+        else:
+            # Fallback: no usable dev set, evaluate all configs on test (old behavior)
+            for approach, weight_type, n_neighbours in approach_configs:
+                try:
+                    test_result = _evaluate_config_on_subset(
+                        store, approach, weight_type, n_neighbours, test_mask, classes_test
+                    )
+                    key = approach
+                    if key not in best_per_approach or test_result['roc_auc'] > best_per_approach[key]['roc_auc']:
+                        best_per_approach[key] = {
+                            'approach': approach,
+                            'weight_type': weight_type,
+                            'n_neighbours': n_neighbours,
+                            'roc_auc': test_result['roc_auc'],
+                            'average_precision': test_result['average_precision'],
+                            'threshold': test_result['threshold'],
+                            'precision': test_result['precision'],
+                            'recall': test_result['recall'],
+                            'f1': test_result['f1'],
+                            'dev_roc_auc': float('nan'),
+                            'test_n_positive': int(len(test_result['pos_scores'])),
+                            'test_n_negative': int(len(test_result['neg_scores'])),
+                            'score_pos_mean': float(np.mean(test_result['pos_scores'])) if len(test_result['pos_scores']) > 0 else float('nan'),
+                            'score_neg_mean': float(np.mean(test_result['neg_scores'])) if len(test_result['neg_scores']) > 0 else float('nan'),
+                            'score_pos_std': float(np.std(test_result['pos_scores'])) if len(test_result['pos_scores']) > 0 else float('nan'),
+                            'score_neg_std': float(np.std(test_result['neg_scores'])) if len(test_result['neg_scores']) > 0 else float('nan'),
+                        }
+                except Exception:
+                    continue
  
         results = list(best_per_approach.values())
  
