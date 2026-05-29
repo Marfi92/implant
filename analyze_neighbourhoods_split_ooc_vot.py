@@ -67,10 +67,12 @@ def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
 # --- CHANGE: Added stratified split generation ---
 # Splits positive and negative words separately, then distributes them
 # proportionally into ref/dev/test so each partition has ~same positive rate
-def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, seed=42):
+def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, seed=42, neg_ratio=None):
     """
     word_list: list of words (may contain duplicates from multiple pickle files)
     class_labels: list/array of 0 or 1 for each word
+    neg_ratio: if set, subsample negatives to neg_ratio * n_positives (e.g., 10 = 10 negatives per positive)
+               if None, use all negatives
     """
     random.seed(seed)
 
@@ -90,10 +92,21 @@ def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, see
     negative_words = [w for w, c in unique_words_with_class.items() if c == 0]
 
     total_unique = len(positive_words) + len(negative_words)
-    print(f"  Total rows in HDF5: {len(word_list)}")
+    print(f"  Total rows: {len(word_list)}")
     print(f"  Unique words: {total_unique}")
-    print(f"  Stratified split: {len(positive_words)} positive, {len(negative_words)} negative unique words")
-    print(f"  Overall positive rate: {len(positive_words)/total_unique:.4%}")
+    print(f"  Before balancing: {len(positive_words)} positive, {len(negative_words)} negative")
+    print(f"  Original positive rate: {len(positive_words)/total_unique:.4%}")
+
+    # --- CHANGE: subsample negatives to reduce class imbalance ---
+    if neg_ratio is not None and len(negative_words) > len(positive_words) * neg_ratio:
+        n_neg_target = len(positive_words) * neg_ratio
+        random.shuffle(negative_words)
+        negative_words = negative_words[:n_neg_target]
+        new_total = len(positive_words) + len(negative_words)
+        print(f"  After balancing (neg_ratio={neg_ratio}): {len(positive_words)} positive, {len(negative_words)} negative")
+        print(f"  Balanced positive rate: {len(positive_words)/new_total:.4%}")
+    else:
+        print(f"  No subsampling applied (neg_ratio={neg_ratio})")
 
     all_splits = {}
     split_id = 0
@@ -164,6 +177,7 @@ def main():
     parser.add_argument('--make-stratified-splits', help='Generate stratified 80/10/10 splits (balanced pos/neg ratio) and exit. Uses --master_list and --stop_list to filter words, looks up classes from HDF5.', action='store_true')
     parser.add_argument('--master_list', help='Path to master word list (one word per line) for split generation.', type=Path)
     parser.add_argument('--stop_list', help='Path to stop word list (one word per line) to exclude from splits.', type=Path)
+    parser.add_argument('--neg_ratio', help='Subsample negatives: keep this many negatives per positive (e.g., 10). Default=None (use all).', type=int, default=None)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
     args = parser.parse_args()
 
@@ -241,7 +255,7 @@ def main():
         if not_found:
             print(f"  ({len(not_found)} words from master list not found in HDF5, skipped)")
 
-        splits = make_stratified_split(matched_words, matched_classes)
+        splits = make_stratified_split(matched_words, matched_classes, neg_ratio=args.neg_ratio)
         out_path = args.split_output
         with open(out_path, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
