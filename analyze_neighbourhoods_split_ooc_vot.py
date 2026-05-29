@@ -161,8 +161,9 @@ def main():
     # --- CHANGE: Added split-based evaluation arguments ---
     parser.add_argument('--splits-file', help='Path to the splits JSON file for split-based evaluation.', type=Path)
     parser.add_argument('--make-splits', help='Generate random 80/10/10 splits and exit.', action='store_true')
-    parser.add_argument('--make-stratified-splits', help='Generate stratified 80/10/10 splits (balanced pos/neg ratio) from HDF5 data and exit.', action='store_true')
-    parser.add_argument('--master_list', help='Path to master implant list for split generation.', type=Path)
+    parser.add_argument('--make-stratified-splits', help='Generate stratified 80/10/10 splits (balanced pos/neg ratio) and exit. Uses --master_list and --stop_list to filter words, looks up classes from HDF5.', action='store_true')
+    parser.add_argument('--master_list', help='Path to master word list (one word per line) for split generation.', type=Path)
+    parser.add_argument('--stop_list', help='Path to stop word list (one word per line) to exclude from splits.', type=Path)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
     args = parser.parse_args()
 
@@ -179,25 +180,68 @@ def main():
         return
 
     # --- CHANGE: Stratified split generation mode ---
-    # Reads word list and class labels from existing HDF5 to create balanced splits
+    # Uses master_list + stop_list to filter words, looks up classes from HDF5
     if args.make_stratified_splits:
-        # Find the HDF5 file
+        if not args.master_list:
+            raise ValueError("Provide --master_list when using --make-stratified-splits")
+
+        # Read master word list
+        with open(args.master_list, "r", encoding="utf-8") as fp:
+            master_words = set(line.strip() for line in fp if line.strip())
+        print(f"Master list: {len(master_words)} words from {args.master_list}")
+
+        # Read stop list (words to exclude)
+        stop_words = set()
+        if args.stop_list:
+            with open(args.stop_list, "r", encoding="utf-8") as fp:
+                stop_words = set(line.strip() for line in fp if line.strip())
+            print(f"Stop list: {len(stop_words)} words from {args.stop_list}")
+
+        # Filter: keep master words that are NOT in stop list
+        filtered_words = master_words - stop_words
+        removed = master_words & stop_words
+        print(f"After removing stop words: {len(filtered_words)} words ({len(removed)} removed)")
+
+        # Look up class labels from HDF5
         output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
         h5_files = list(output_dir.glob("neigbourhood_analysis_*.h5"))
         if not h5_files:
             h5_files = list(output_dir.glob("neigbourhood_distances_*.h5"))
         if not h5_files:
-            raise FileNotFoundError(f"No HDF5 file found in {output_dir}. Run without --make-stratified-splits first to generate the HDF5 data, then re-run with --make-stratified-splits.")
+            raise FileNotFoundError(f"No HDF5 file found in {output_dir}. Run without --make-stratified-splits first.")
         h5_file = h5_files[0]
-        print(f"Reading word data from: {h5_file}")
+        print(f"Looking up word classes from: {h5_file}")
         with h5py.File(h5_file, 'r') as store:
-            query_word_classes = store['query_word_classes'][:]
-            if 'query_words' in store:
-                raw_qwords = store['query_words'][:]
-                word_list = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
+            h5_classes = store['query_word_classes'][:]
+            if 'query_words' not in store:
+                raise RuntimeError("HDF5 missing 'query_words'. Re-run with --recalculate.")
+            raw_qwords = store['query_words'][:]
+            h5_words = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
+
+        # Build word->class mapping from HDF5 (majority vote for duplicates)
+        word_class_votes = {}
+        for w, c in zip(h5_words, h5_classes):
+            if w not in word_class_votes:
+                word_class_votes[w] = []
+            word_class_votes[w].append(int(c))
+        word_to_class = {w: (1 if sum(cs) > len(cs)/2 else 0) for w, cs in word_class_votes.items()}
+
+        # Match filtered words to HDF5 classes
+        matched_words = []
+        matched_classes = []
+        not_found = []
+        for w in sorted(filtered_words):
+            if w in word_to_class:
+                matched_words.append(w)
+                matched_classes.append(word_to_class[w])
             else:
-                raise RuntimeError("HDF5 file does not contain 'query_words'. Re-run with --recalculate to generate it.")
-        splits = make_stratified_split(word_list, query_word_classes)
+                not_found.append(w)
+
+        print(f"Matched {len(matched_words)} words to HDF5 data")
+        if not_found:
+            print(f"  ({len(not_found)} words from master list not found in HDF5, skipped)")
+
+        splits = make_stratified_split(matched_words, matched_classes)
         out_path = args.split_output
         with open(out_path, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
