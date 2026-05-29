@@ -110,7 +110,8 @@ def main():
     neighbourhood_hash = neighbourhood_hash.hexdigest()
     output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
     output_dir.mkdir(exist_ok=True, parents=True)
-    votes_file = output_dir / f"neigbourhood_distances_{neighbourhood_hash}.h5"
+    # --- CHANGE: renamed from distances to analysis (vote-based approach) ---
+    votes_file = output_dir / f"neigbourhood_analysis_{neighbourhood_hash}.h5"
 
     if args.recalculate or not votes_file.exists():
         partial_file: Path = votes_file.with_suffix('.tmp')
@@ -132,8 +133,9 @@ def main():
                     n_batch_words = len(batch_query_word_classes)
                     n_words += n_batch_words
                     query_word_classes.append(batch_query_word_classes)
-                    batch_distances = example['distances']
-                    votes.append(batch_distances)
+                    # --- CHANGE: use 'votes' (weighted positive counts) instead of 'distances' ---
+                    batch_votes = example['votes']
+                    votes.append(batch_votes)
                     # --- CHANGE: collect query words ---
                     query_word_lists.append(example.get('query_words', []))
                     if n_words >= args.chunk_size:
@@ -370,10 +372,10 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if not test_mask.any():
             return None, split_info
 
-        # Collect all configs (same structure as boss's code: centrality_measures × n_neighbours)
-        centrality_measures = store.attrs.get('centrality_measures', [])
+        # Collect all configs (weighting_function × n_neighbours)
+        weighting_functions = store.attrs.get('weighting_function', [])
         approach_configs = []
-        for weight_type in centrality_measures:
+        for weight_type in weighting_functions:
             g = store[weight_type]
             for nn in g.attrs['n_neighbours']:
                 approach_configs.append((weight_type, nn))
@@ -387,7 +389,8 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if use_dev:
             for weight_type, n_neighbours in approach_configs:
                 try:
-                    dev_scores = np.exp(-store[weight_type][str(n_neighbours)][:])
+                    # --- CHANGE: use votes directly, no exp(-x) transform ---
+                    dev_scores = store[weight_type][str(n_neighbours)][:]
                     dev_scores_sub = dev_scores[dev_mask]
                     fpr, tpr, roc_thresh = roc_curve(classes_dev, dev_scores_sub)
                     dev_auc = _trapz(tpr, fpr)
@@ -411,8 +414,8 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
 
         weight_type, n_neighbours = best_dev_config
         try:
-            # Boss's scoring: exp(-distance)
-            test_scores = np.exp(-store[weight_type][str(n_neighbours)][:])
+            # --- CHANGE: use votes directly, no exp(-x) transform ---
+            test_scores = store[weight_type][str(n_neighbours)][:]
             test_scores_sub = test_scores[test_mask]
 
             fpr, tpr, roc_thresholds = roc_curve(classes_test, test_scores_sub)
@@ -541,11 +544,11 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     if any_remaining_votes:
         remaining_votes.append(remaining_votes_batch)
 
-    # --- CHANGE: write centrality_measures attribute ---
-    centrality_measures = set(flattened_votes.keys())
-    if 'centrality_measures' in store.attrs:
-        centrality_measures.update(store.attrs['centrality_measures'])
-    store.attrs['centrality_measures'] = sorted(centrality_measures)
+    # --- CHANGE: write weighting_function attribute (boss's original naming from occ general) ---
+    weighting_functions = set(flattened_votes.keys())
+    if 'weighting_function' in store.attrs:
+        weighting_functions.update(store.attrs['weighting_function'])
+    store.attrs['weighting_function'] = sorted(weighting_functions)
 
     return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
 
@@ -554,8 +557,8 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
-        centrality_measures = store.attrs['centrality_measures']
-        for weight_type in centrality_measures:
+        weighting_functions = store.attrs['weighting_function']
+        for weight_type in weighting_functions:
             g = store[weight_type]
             all_n_neighbours = g.attrs['n_neighbours']
             for n_neighbours in all_n_neighbours:
@@ -578,8 +581,8 @@ def statistics_worker(work_package):
         query_word_classes = store['query_word_classes'][:]
         positive_words = int(np.sum(query_word_classes))
         negative_words = len(query_word_classes) - positive_words
-        # Boss's scoring: exp(-distance)
-        votes = np.exp(-store[weight_type][str(n_neighbours)][:])
+        # --- CHANGE: use votes directly (weighted positive neighbor counts), no exp(-x) transform ---
+        votes = store[weight_type][str(n_neighbours)][:]
         fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
         roc_auc = _trapz(tpr, fpr)
         precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
@@ -668,22 +671,27 @@ def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
         raise RuntimeError("Array lengths differs")
 
     n_neighbours = list(range(1, neighbourhood_limit+1))
-    distances = get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours)
+    # --- CHANGE: use get_votes (weighted positive counts) instead of get_central_distance ---
+    votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
     return {"query_word_classes": query_word_classes,
-            "distances": distances,
+            "votes": votes,
             "query_words": query_words}  # --- CHANGE: return query_words ---
 
 
-# Boss's original (unchanged)
-def get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours):
-    distances = {}
-    for measure, measure_fun in [('mean', np.mean), ('median', np.median)]:
-        distance_per_neighbourhood = {}
+# --- CHANGE: replaced get_central_distance with get_votes from boss's "occ general" script ---
+# This computes weighted sum of positive neighbor class labels instead of mean/median distance
+def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
+    votes = {}
+    for weight_type in ['constant', 'inverse', 'exponential']:
+        weight_type_votes = {}
+        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)
+        neighbour_weighted_classes = neighbour_weights * neighbourhood_classes
+        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)
         for i in n_neighbours:
-            distance_per_neighbourhood[i] = measure_fun(neighbourhood_distances[:, :i], axis=1)
-        distances[measure] = distance_per_neighbourhood
-    return distances
+            weight_type_votes[i] = neighbour_cumsums[:, i-1]
+        votes[weight_type] = weight_type_votes
+    return votes
 
 
 # Boss's original (unchanged)
