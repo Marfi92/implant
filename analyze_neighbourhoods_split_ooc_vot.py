@@ -69,26 +69,41 @@ def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
 # proportionally into ref/dev/test so each partition has ~same positive rate
 def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, seed=42):
     """
-    word_list: list of words
+    word_list: list of words (may contain duplicates from multiple pickle files)
     class_labels: list/array of 0 or 1 for each word
     """
     random.seed(seed)
-    positive_words = [w for w, c in zip(word_list, class_labels) if c == 1]
-    negative_words = [w for w, c in zip(word_list, class_labels) if c == 0]
-    print(f"  Stratified split: {len(positive_words)} positive, {len(negative_words)} negative words")
-    print(f"  Overall positive rate: {len(positive_words)/(len(positive_words)+len(negative_words)):.4%}")
+
+    # Deduplicate: same word may appear in multiple pickle files
+    # Use majority vote for class label if a word has conflicting labels
+    word_class = {}
+    for w, c in zip(word_list, class_labels):
+        if w not in word_class:
+            word_class[w] = []
+        word_class[w].append(int(c))
+
+    unique_words_with_class = {}
+    for w, classes in word_class.items():
+        unique_words_with_class[w] = 1 if sum(classes) > len(classes) / 2 else 0
+
+    positive_words = [w for w, c in unique_words_with_class.items() if c == 1]
+    negative_words = [w for w, c in unique_words_with_class.items() if c == 0]
+
+    total_unique = len(positive_words) + len(negative_words)
+    print(f"  Total rows in HDF5: {len(word_list)}")
+    print(f"  Unique words: {total_unique}")
+    print(f"  Stratified split: {len(positive_words)} positive, {len(negative_words)} negative unique words")
+    print(f"  Overall positive rate: {len(positive_words)/total_unique:.4%}")
 
     all_splits = {}
     split_id = 0
     for r in range(n_repeats):
         for f in range(n_folds):
-            # Shuffle each class separately
             pos = positive_words[:]
             neg = negative_words[:]
             random.shuffle(pos)
             random.shuffle(neg)
 
-            # Split each class into 80/10/10
             n_pos = len(pos)
             n_pos_ref = int(n_pos * 0.80)
             n_pos_dev = int(n_pos * 0.10)
@@ -101,7 +116,6 @@ def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, see
             dev = pos[n_pos_ref:n_pos_ref+n_pos_dev] + neg[n_neg_ref:n_neg_ref+n_neg_dev]
             test = pos[n_pos_ref+n_pos_dev:] + neg[n_neg_ref+n_neg_dev:]
 
-            # Shuffle within each partition so positives/negatives are mixed
             random.shuffle(ref)
             random.shuffle(dev)
             random.shuffle(test)
@@ -116,9 +130,9 @@ def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, see
     # Print stats for first split as sanity check
     first = all_splits[0]
     for part_name in ('ref', 'dev', 'test'):
-        part_words = set(first[part_name])
-        n_pos_in_part = sum(1 for w, c in zip(word_list, class_labels) if w in part_words and c == 1)
-        n_total_in_part = len(first[part_name])
+        part_words = first[part_name]
+        n_pos_in_part = sum(1 for w in part_words if unique_words_with_class.get(w, 0) == 1)
+        n_total_in_part = len(part_words)
         rate = n_pos_in_part / n_total_in_part if n_total_in_part > 0 else 0
         print(f"  Split 0 {part_name}: {n_total_in_part} words, {n_pos_in_part} positive ({rate:.4%})")
 
