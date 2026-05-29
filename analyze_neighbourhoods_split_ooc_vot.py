@@ -64,6 +64,67 @@ def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
     return all_splits
 
 
+# --- CHANGE: Added stratified split generation ---
+# Splits positive and negative words separately, then distributes them
+# proportionally into ref/dev/test so each partition has ~same positive rate
+def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, seed=42):
+    """
+    word_list: list of words
+    class_labels: list/array of 0 or 1 for each word
+    """
+    random.seed(seed)
+    positive_words = [w for w, c in zip(word_list, class_labels) if c == 1]
+    negative_words = [w for w, c in zip(word_list, class_labels) if c == 0]
+    print(f"  Stratified split: {len(positive_words)} positive, {len(negative_words)} negative words")
+    print(f"  Overall positive rate: {len(positive_words)/(len(positive_words)+len(negative_words)):.4%}")
+
+    all_splits = {}
+    split_id = 0
+    for r in range(n_repeats):
+        for f in range(n_folds):
+            # Shuffle each class separately
+            pos = positive_words[:]
+            neg = negative_words[:]
+            random.shuffle(pos)
+            random.shuffle(neg)
+
+            # Split each class into 80/10/10
+            n_pos = len(pos)
+            n_pos_ref = int(n_pos * 0.80)
+            n_pos_dev = int(n_pos * 0.10)
+
+            n_neg = len(neg)
+            n_neg_ref = int(n_neg * 0.80)
+            n_neg_dev = int(n_neg * 0.10)
+
+            ref = pos[:n_pos_ref] + neg[:n_neg_ref]
+            dev = pos[n_pos_ref:n_pos_ref+n_pos_dev] + neg[n_neg_ref:n_neg_ref+n_neg_dev]
+            test = pos[n_pos_ref+n_pos_dev:] + neg[n_neg_ref+n_neg_dev:]
+
+            # Shuffle within each partition so positives/negatives are mixed
+            random.shuffle(ref)
+            random.shuffle(dev)
+            random.shuffle(test)
+
+            all_splits[split_id] = {
+                "ref": ref,
+                "dev": dev,
+                "test": test
+            }
+            split_id += 1
+
+    # Print stats for first split as sanity check
+    first = all_splits[0]
+    for part_name in ('ref', 'dev', 'test'):
+        part_words = set(first[part_name])
+        n_pos_in_part = sum(1 for w, c in zip(word_list, class_labels) if w in part_words and c == 1)
+        n_total_in_part = len(first[part_name])
+        rate = n_pos_in_part / n_total_in_part if n_total_in_part > 0 else 0
+        print(f"  Split 0 {part_name}: {n_total_in_part} words, {n_pos_in_part} positive ({rate:.4%})")
+
+    return all_splits
+
+
 # --- CHANGE: Added bootstrap CI helper (Erik's suggestion) ---
 def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
     rng = np.random.RandomState(seed)
@@ -86,6 +147,7 @@ def main():
     # --- CHANGE: Added split-based evaluation arguments ---
     parser.add_argument('--splits-file', help='Path to the splits JSON file for split-based evaluation.', type=Path)
     parser.add_argument('--make-splits', help='Generate random 80/10/10 splits and exit.', action='store_true')
+    parser.add_argument('--make-stratified-splits', help='Generate stratified 80/10/10 splits (balanced pos/neg ratio) from HDF5 data and exit.', action='store_true')
     parser.add_argument('--master_list', help='Path to master implant list for split generation.', type=Path)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
     args = parser.parse_args()
@@ -100,6 +162,32 @@ def main():
         with open(args.split_output, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
         print(f"Saved {len(splits)} splits to: {args.split_output}")
+        return
+
+    # --- CHANGE: Stratified split generation mode ---
+    # Reads word list and class labels from existing HDF5 to create balanced splits
+    if args.make_stratified_splits:
+        # Find the HDF5 file
+        output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
+        h5_files = list(output_dir.glob("neigbourhood_analysis_*.h5"))
+        if not h5_files:
+            h5_files = list(output_dir.glob("neigbourhood_distances_*.h5"))
+        if not h5_files:
+            raise FileNotFoundError(f"No HDF5 file found in {output_dir}. Run without --make-stratified-splits first to generate the HDF5 data, then re-run with --make-stratified-splits.")
+        h5_file = h5_files[0]
+        print(f"Reading word data from: {h5_file}")
+        with h5py.File(h5_file, 'r') as store:
+            query_word_classes = store['query_word_classes'][:]
+            if 'query_words' in store:
+                raw_qwords = store['query_words'][:]
+                word_list = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
+            else:
+                raise RuntimeError("HDF5 file does not contain 'query_words'. Re-run with --recalculate to generate it.")
+        splits = make_stratified_split(word_list, query_word_classes)
+        out_path = args.split_output
+        with open(out_path, "w", encoding="utf-8") as fp:
+            json.dump(splits, fp, indent=2, ensure_ascii=False)
+        print(f"\nSaved {len(splits)} stratified splits to: {out_path}")
         return
 
     neighbourhood_files = sorted(args.neighbourhoods.glob("*.pkl"))
