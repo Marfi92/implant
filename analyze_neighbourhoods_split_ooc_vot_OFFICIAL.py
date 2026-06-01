@@ -1,21 +1,5 @@
-#python analyze_neighbourhoods_split_ooc_vot.py \
-  /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ \
-  --make-splits \
-  --master_list /home/abragam23/fedhealth_data/Glossary_updated_master.txt \
-  --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt \
-  --split_output /home/abragam23/fedhealth_data/implant_split_official.json
-#for D in \
-  17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19 \
-  1ddd748b-3d5d-4a66-80e3-685f0f5d04f2/local_test_results/vector_database_FL_global_model_8 \
-  2f3ecdb8-c55a-46e1-9853-d043448e8d25/local_test_results/vector_database_FL_global_model_10 \
-  ca859b72-ee44-4eca-a823-5a82191fd7dc/local_test_results/vector_database_FL_global_model_99 ; do
-  python analyze_neighbourhoods_split_ooc_vot.py \
-    /home/abragam23/federatedhealth_20250617/results_nov12_2025/$D/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ \
-    --splits-file /home/abragam23/fedhealth_data/implant_split_official.json \
-    --official \
-    --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt \
-    --output-dir /home/abragam23/federatedhealth_20250617/results_nov12_2025/$D/analysis_official/ \
-    --recalculate
+
+#python analyze_neighbourhoods_split_ooc_vot_OFFICIAL.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --make-splits --master_list /home/abragam23/fedhealth_data/Glossary_updated_master.txt --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt --split_output /home/abragam23/fedhealth_data/implant_split_official.json
 
 
 import argparse
