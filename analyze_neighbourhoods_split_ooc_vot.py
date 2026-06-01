@@ -153,6 +153,31 @@ def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, see
 
 
 # --- CHANGE: Added bootstrap CI helper (Erik's suggestion) ---
+# --- CHANGE: step 3a, verify each split has distinct (disjoint) ref/dev/test subsets ---
+def verify_splits_distinct(splits):
+    print(f"\n  Checking {len(splits)} splits for distinct ref/dev/test subsets...")
+    all_ok = True
+    for split_id, parts in splits.items():
+        ref, dev, test = set(parts["ref"]), set(parts["dev"]), set(parts["test"])
+        problems = []
+        if ref & dev:
+            problems.append(f"ref∩dev={len(ref & dev)}")
+        if ref & test:
+            problems.append(f"ref∩test={len(ref & test)}")
+        if dev & test:
+            problems.append(f"dev∩test={len(dev & test)}")
+        if len(parts["ref"]) != len(ref) or len(parts["dev"]) != len(dev) or len(parts["test"]) != len(test):
+            problems.append("duplicates within a subset")
+        if problems:
+            all_ok = False
+            print(f"    Split {split_id}: NOT DISTINCT -> {', '.join(problems)}")
+    if all_ok:
+        print("  OK: every split has distinct ref/dev/test subsets (no overlaps, no duplicates).")
+    else:
+        print("  WARNING: some splits have overlapping/duplicate subsets (see above).")
+    return all_ok
+
+
 def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
     rng = np.random.RandomState(seed)
     n = len(values)
@@ -256,6 +281,10 @@ def main():
             print(f"  ({len(not_found)} words from master list not found in HDF5, skipped)")
 
         splits = make_stratified_split(matched_words, matched_classes, neg_ratio=args.neg_ratio)
+
+        # --- CHANGE: verify each split has distinct ref/dev/test subsets (step 3a) ---
+        verify_splits_distinct(splits)
+
         out_path = args.split_output
         with open(out_path, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
