@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
 # --- CHANGE: numpy >= 2.0 renamed np.trapz to np.trapezoid ---
-_trapz = getattr(np, 'trapezoid', np.trapz)
+_trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
 
 class NeighbourHoodDataset(Dataset):
     def __init__(self, neighbourhood_files, neighbourhood_limit=None):
@@ -204,18 +204,36 @@ def main():
     parser.add_argument('--stop_list', help='Path to stop word list (one word per line) to exclude from splits.', type=Path)
     parser.add_argument('--neg_ratio', help='Subsample negatives: keep this many negatives per positive (e.g., 10). Default=None (use all).', type=int, default=None)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
+    # --- CHANGE: boss's exact step-5 method (labels derived from the lists, not the pickles) ---
+    parser.add_argument('--official', help="Use the boss's method: neighbour label = word is in the split's 'ref' implant list; "
+                                           "query positive = word is in 'dev'/'test'; negative = any word not in the implant list "
+                                           "(and not in --stop_list). Scores are recomputed per split from the raw neighbours.",
+                        action='store_true')
     args = parser.parse_args()
 
     # --- CHANGE: Split generation mode ---
+    # Boss's step 3: split the master IMPLANT list (all positives) into ref/dev/test.
+    # The ref list is what tags the stored vectors; dev/test are the query labels.
     if args.make_splits:
         if not args.master_list:
             raise ValueError("Provide --master_list when using --make-splits")
         with open(args.master_list, "r", encoding="utf-8") as fp:
             master_list = [line.strip() for line in fp if line.strip()]
+        # de-duplicate while preserving order
+        master_list = list(dict.fromkeys(master_list))
+        print(f"Master implant list: {len(master_list)} words from {args.master_list}")
+        # remove stop words if a stop list is provided
+        if args.stop_list:
+            with open(args.stop_list, "r", encoding="utf-8") as fp:
+                stop_words = set(line.strip() for line in fp if line.strip())
+            before = len(master_list)
+            master_list = [w for w in master_list if w not in stop_words]
+            print(f"After removing stop words: {len(master_list)} words ({before - len(master_list)} removed)")
         splits = make_random_split(master_list)
+        verify_splits_distinct(splits)
         with open(args.split_output, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
-        print(f"Saved {len(splits)} splits to: {args.split_output}")
+        print(f"\nSaved {len(splits)} implant-list splits to: {args.split_output}")
         return
 
     # --- CHANGE: Stratified split generation mode ---
@@ -301,6 +319,21 @@ def main():
     output_dir.mkdir(exist_ok=True, parents=True)
     # --- CHANGE: renamed from distances to analysis (vote-based approach) ---
     votes_file = output_dir / f"neigbourhood_analysis_{neighbourhood_hash}.h5"
+
+    # --- CHANGE: boss's exact method (step 5). Labels come from the lists, not the pickles.
+    # Build a raw neighbour store (query word + neighbour words + distances) once, then
+    # recompute scores per split. ---
+    if args.official:
+        if not args.splits_file:
+            raise ValueError("--official requires --splits-file")
+        raw_store = output_dir / f"neighbour_raw_{neighbourhood_hash}.h5"
+        if args.recalculate or not raw_store.exists():
+            neighbour_limit = get_neighbourhood_limit(neighbourhood_files, num_workers=args.num_workers)
+            if neighbour_limit is None or neighbour_limit < 0:
+                raise RuntimeError(f"Could not determine the neighbourhood limit, got {neighbour_limit}.")
+            build_neighbour_store(neighbourhood_files, raw_store, neighbour_limit)
+        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list)
+        return
 
     if args.recalculate or not votes_file.exists():
         partial_file: Path = votes_file.with_suffix('.tmp')
@@ -405,6 +438,11 @@ def run_split_evaluation(votes_file, splits_file, output_dir):
                 result['split_id'] = int(split_id)
             all_split_results.extend(split_results)
 
+    report_split_results(all_split_results, all_split_info, output_dir)
+
+
+# --- CHANGE: shared reporting/aggregation used by both split evaluators ---
+def report_split_results(all_split_results, all_split_info, output_dir):
     # Print split diagnostic info
     if all_split_info:
         info_df = pd.DataFrame(all_split_info)
@@ -506,9 +544,12 @@ def run_split_evaluation(votes_file, splits_file, output_dir):
     for metric in ['roc_auc', 'precision', 'recall', 'f1', 'average_precision']:
         if metric not in results_df.columns:
             continue
+        metric_values = results_df[metric].dropna()
+        if metric_values.empty:
+            continue
         plt.figure(figsize=(8, 5))
-        plt.hist(results_df[metric], bins=20, edgecolor='black', alpha=0.7)
-        mean_val = results_df[metric].mean()
+        plt.hist(metric_values, bins=20, edgecolor='black', alpha=0.7)
+        mean_val = metric_values.mean()
         plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
         plt.xlabel(metric)
         plt.ylabel("Count")
@@ -641,6 +682,263 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
             return [result], split_info
         except Exception:
             return None, split_info
+
+
+# ======================================================================
+# --- CHANGE: Boss's exact step-5 method ---
+# Labels are derived from the lists (stop list + implant split), NOT from
+# the pickled neighbourhoods. ALL words in the HDF5 are used as the
+# background (negatives). Because a neighbour counts as positive only if
+# it is in the split's "ref" implant list, the scores must be recomputed
+# for every split. To make that feasible we store the raw neighbours once
+# (query word + neighbour words as vocab IDs + distances) and recompute
+# the weighted votes per split.
+# ======================================================================
+def build_neighbour_store(neighbourhood_files, store_file, neighbour_limit):
+    """Read the pickles once and store, per unique query word:
+        - the query word (as a vocab id),
+        - its first `neighbour_limit` neighbour words (as vocab ids),
+        - the matching neighbour distances.
+    The stored words let us re-derive labels from the lists at eval time."""
+    print(f"\nBuilding raw neighbour store (neighbour_limit={neighbour_limit})...")
+    word_to_id = {}
+
+    def wid(word):
+        i = word_to_id.get(word)
+        if i is None:
+            i = len(word_to_id)
+            word_to_id[word] = i
+        return i
+
+    seen_query = set()
+    query_ids = []
+    neigh_ids = []
+    neigh_dists = []
+
+    for neighbourhood_file in tqdm(neighbourhood_files, desc="Reading neighbourhoods"):
+        with open(neighbourhood_file, 'rb') as fp:
+            neighbourhood_data = pickle.load(fp)
+        neighbourhoods = neighbourhood_data["neighbourhoods"]
+
+        for (query_word, query_label), neighbours in neighbourhoods:
+            # one row per unique query word (word-level evaluation)
+            if query_word in seen_query:
+                continue
+            nb = neighbours[:neighbour_limit]
+            if len(nb) < neighbour_limit:
+                continue  # keep rows uniform-length
+            seen_query.add(query_word)
+            query_ids.append(wid(query_word))
+            ids_row = np.empty(neighbour_limit, dtype=np.int64)
+            dist_row = np.empty(neighbour_limit, dtype=np.float32)
+            for j, (cossim, neighbour_word, neighbour_label) in enumerate(nb):
+                ids_row[j] = wid(neighbour_word)
+                dist_row[j] = cossim
+            neigh_ids.append(ids_row)
+            neigh_dists.append(dist_row)
+
+    query_ids = np.array(query_ids, dtype=np.int64)
+    if neigh_ids:
+        neigh_ids = np.vstack(neigh_ids)
+        neigh_dists = np.vstack(neigh_dists)
+    else:
+        neigh_ids = np.zeros((0, neighbour_limit), dtype=np.int64)
+        neigh_dists = np.zeros((0, neighbour_limit), dtype=np.float32)
+
+    vocab = np.empty(len(word_to_id), dtype=object)
+    for word, i in word_to_id.items():
+        vocab[i] = word
+
+    print(f"  Unique query words: {len(query_ids)}")
+    print(f"  Vocabulary size (query + neighbour words): {len(vocab)}")
+
+    partial = store_file.with_suffix('.tmp')
+    string_dt = h5py.string_dtype(encoding='utf-8')
+    with h5py.File(partial, 'w') as store:
+        store.create_dataset('vocab', data=vocab, dtype=string_dt)
+        store.create_dataset('query_word_ids', data=query_ids)
+        store.create_dataset('neighbour_ids', data=neigh_ids)
+        store.create_dataset('neighbour_distances', data=neigh_dists)
+        store.attrs['neighbour_limit'] = int(neighbour_limit)
+    partial.rename(store_file)
+    print(f"  Saved raw neighbour store to: {store_file}")
+
+
+def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None):
+    """Boss's exact method (step 5): re-derive labels from the lists.
+
+    For each split:
+      - a NEIGHBOUR is positive iff it is in the split's 'ref' implant list;
+      - a QUERY word is positive iff it is in 'dev' (stage 1) / 'test' (stage 2);
+      - a QUERY word is negative iff it is NOT in any implant list AND not in
+        the stop list (all remaining HDF5 words form the background);
+      - the weighted vote for a query word = sum over its neighbours of
+        weight(distance) * [neighbour in ref].
+    Best (weight_type, n_neighbours) is picked on dev, then evaluated on test.
+    """
+    print(f"\nRunning OFFICIAL split-based evaluation (labels from lists) using: {splits_file}")
+    with open(splits_file, "r", encoding="utf-8") as fp:
+        splits = json.load(fp)
+    print(f"Loaded {len(splits)} splits")
+
+    with h5py.File(store_file, 'r') as store:
+        raw_vocab = store['vocab'][:]
+        query_word_ids = store['query_word_ids'][:]
+        neighbour_ids = store['neighbour_ids'][:]
+        neighbour_distances = store['neighbour_distances'][:]
+        neighbour_limit = int(store.attrs['neighbour_limit'])
+
+    vocab = [w.decode('utf-8') if isinstance(w, (bytes, np.bytes_)) else str(w) for w in raw_vocab]
+    word2id = {w: i for i, w in enumerate(vocab)}
+    vocab_size = len(vocab)
+    n_queries = len(query_word_ids)
+    print(f"  Unique query words (all HDF5 background): {n_queries}")
+    print(f"  Vocabulary size: {vocab_size}")
+
+    def ids_for(words):
+        s = set()
+        for w in words:
+            i = word2id.get(w)
+            if i is not None:
+                s.add(i)
+        return s
+
+    # Stop-list ids
+    stop_ids = set()
+    if stop_list_file:
+        with open(stop_list_file, "r", encoding="utf-8") as fp:
+            stop_ids = ids_for(line.strip() for line in fp if line.strip())
+    print(f"  Stop words present in vocab: {len(stop_ids)}")
+
+    # Master implant ids = union of ref/dev/test across all splits.
+    master_ids = set()
+    for parts in splits.values():
+        for key in ('ref', 'dev', 'test'):
+            master_ids |= ids_for(parts[key])
+    print(f"  Master implant words present in vocab: {len(master_ids)}")
+
+    # Precompute per-query helper arrays (constant across splits).
+    is_master_q = np.array([qid in master_ids for qid in query_word_ids], dtype=bool)
+    is_stop_q = np.array([qid in stop_ids for qid in query_word_ids], dtype=bool)
+    # background negatives: not an implant (any split) and not a stop word
+    base_negative = (~is_master_q) & (~is_stop_q)
+    print(f"  Background negatives (non-implant, non-stop): {int(base_negative.sum())}")
+
+    # Precompute neighbour weights per weight_type (distances are fixed).
+    weight_types = ['constant', 'inverse', 'exponential']
+    weights = {wt: weighting_function(neighbour_distances, weight_type=wt) for wt in weight_types}
+    n_neighbours_list = list(range(1, neighbour_limit + 1))
+
+    all_split_results = []
+    all_split_info = []
+
+    is_ref = np.zeros(vocab_size, dtype=bool)
+    for split_id, parts in tqdm(splits.items(), desc="Evaluating splits"):
+        ref_ids = ids_for(parts['ref'])
+        dev_ids = ids_for(parts['dev'])
+        test_ids = ids_for(parts['test'])
+
+        # neighbour positive mask for this split (ref tags the vectors)
+        is_ref[:] = False
+        if ref_ids:
+            is_ref[list(ref_ids)] = True
+        neighbour_is_ref = is_ref[neighbour_ids]  # (n_queries, neighbour_limit) bool
+
+        q_in_dev = np.array([qid in dev_ids for qid in query_word_ids], dtype=bool)
+        q_in_test = np.array([qid in test_ids for qid in query_word_ids], dtype=bool)
+
+        dev_mask = q_in_dev | base_negative
+        test_mask = q_in_test | base_negative
+        y_dev = q_in_dev[dev_mask].astype(np.int8)
+        y_test = q_in_test[test_mask].astype(np.int8)
+
+        split_info = {
+            'split_id': int(split_id),
+            'total_words_in_data': n_queries,
+            'total_positive_in_data': int(is_master_q.sum()),
+            'total_negative_in_data': int(base_negative.sum()),
+            'test_matched': int(test_mask.sum()),
+            'test_positive': int(q_in_test.sum()),
+            'test_negative': int(base_negative.sum()),
+            'test_positive_rate': float(q_in_test.sum()) / int(test_mask.sum()) if test_mask.any() else 0.0,
+            'dev_matched': int(dev_mask.sum()),
+            'dev_positive': int(q_in_dev.sum()),
+            'dev_negative': int(base_negative.sum()),
+        }
+        all_split_info.append(split_info)
+
+        if not test_mask.any() or len(np.unique(y_test)) < 2:
+            continue
+
+        # Stage 1: pick best (weight_type, n_neighbours) on dev.
+        best_dev_auc = -1.0
+        best_dev_config = None
+        best_dev_threshold = 0.0
+        cumsum_cache = {}
+        for wt in weight_types:
+            weighted = weights[wt] * neighbour_is_ref
+            cum = np.cumsum(weighted, axis=1)
+            cumsum_cache[wt] = cum
+            if len(np.unique(y_dev)) < 2:
+                continue
+            for n in n_neighbours_list:
+                scores_dev = cum[:, n - 1][dev_mask]
+                try:
+                    fpr, tpr, roc_thresh = roc_curve(y_dev, scores_dev)
+                    dev_auc = _trapz(tpr, fpr)
+                except Exception:
+                    continue
+                if dev_auc > best_dev_auc:
+                    best_dev_auc = dev_auc
+                    best_dev_config = (wt, n)
+                    youdens_j = tpr - fpr
+                    best_dev_threshold = roc_thresh[np.argmax(youdens_j)]
+
+        if best_dev_config is None:
+            best_dev_config = ('constant', neighbour_limit)
+            best_dev_auc = float('nan')
+            best_dev_threshold = 0.0
+
+        # Stage 2: evaluate best config on test.
+        wt, n = best_dev_config
+        cum = cumsum_cache.get(wt)
+        if cum is None:
+            cum = np.cumsum(weights[wt] * neighbour_is_ref, axis=1)
+        test_scores = cum[:, n - 1][test_mask]
+        try:
+            fpr, tpr, _ = roc_curve(y_test, test_scores)
+            roc_auc = _trapz(tpr, fpr)
+            precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(y_test, test_scores)
+            ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
+
+            discretized = test_scores > best_dev_threshold
+            if discretized.any() and not discretized.all():
+                prec = precision_score(y_test, discretized, zero_division=0)
+                rec = recall_score(y_test, discretized, zero_division=0)
+                f1_val = f1_score(y_test, discretized, zero_division=0)
+            else:
+                f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
+                best_idx = int(np.argmax(f1_sweep))
+                prec = precision_sweep[best_idx]
+                rec = recall_sweep[best_idx]
+                f1_val = f1_sweep[best_idx]
+
+            all_split_results.append({
+                'split_id': int(split_id),
+                'weight_type': wt,
+                'n_neighbours': n,
+                'roc_auc': roc_auc,
+                'average_precision': ap,
+                'threshold': best_dev_threshold,
+                'precision': prec,
+                'recall': rec,
+                'f1': f1_val,
+                'dev_roc_auc': best_dev_auc,
+            })
+        except Exception:
+            continue
+
+    report_split_results(all_split_results, all_split_info, output_dir)
 
 
 # Boss's original record_results — CHANGED: added query_word_lists parameter for storing query words
