@@ -3,6 +3,17 @@
 #python analyze_neighbourhoods_split_ooc_vot.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --make-stratified-splits --split_output /home/abragam23/fedhealth_data/implant_split_stratified.json
 #python analyze_neighbourhoods_split_ooc_vot_3.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --splits-file /home/abragam23/fedhealth_data/implant_split_stratified.json
 
+
+python analyze_neighbourhoods_split_ooc_vot_3.py \
+  /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ \
+  --make-stratified-splits \
+  --master_list /home/abragam23/fedhealth_data/Glossary_updated_master.txt \
+  --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt \
+  --neg_ratio 10 \
+  --split_output /home/abragam23/fedhealth_data/implant_split_balanced.json
+
+
+
 #python analyze_neighbourhoods_split_ooc_vot.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --make-stratified-splits --master_list /home/abragam23/fedhealth_data/Glossary_updated_master.txt --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt --neg_ratio 10 --split_output /home/abragam23/fedhealth_data/implant_split_balanced.json
 python analyze_neighbourhoods_split_ooc_vot.py /home/abragam23/federatedhealth_20250617/results_nov12_2025/17dc75eb-6f4c-466b-92bc-60882b73c01c/local_test_results/vector_database_FL_global_model_19/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/ --make-stratified-splits --master_list /home/abragam23/fedhealth_data/Glossary_updated_master.txt --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt --neg_ratio 10 --split_output /home/abragam23/fedhealth_data/implant_split_balanced.json
 
