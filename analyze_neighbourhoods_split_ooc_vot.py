@@ -42,6 +42,9 @@ def no_tensor_collator(batch):
 
 EVAL_METRICS = ('roc_auc', 'precision', 'recall', 'f1', 'average_precision')
 
+# Top-k cut-offs for precision@k reporting (precision among the k highest-scored words).
+TOP_K_VALUES = (50, 100, 200)
+
 
 # --- CHANGE: Added split generation helper ---
 def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
@@ -204,15 +207,15 @@ def main():
     parser.add_argument('--stop_list', help='Path to stop word list (one word per line) to exclude from splits.', type=Path)
     parser.add_argument('--neg_ratio', help='Subsample negatives: keep this many negatives per positive (e.g., 10). Default=None (use all).', type=int, default=None)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
-    # --- CHANGE: boss's exact step-5 method (labels derived from the lists, not the pickles) ---
-    parser.add_argument('--official', help="Use the boss's method: neighbour label = word is in the split's 'ref' implant list; "
+    # List-based labelling mode: labels are derived from the lists, not the pickles.
+    parser.add_argument('--official', help="List-based labelling: neighbour label = word is in the split's 'ref' implant list; "
                                            "query positive = word is in 'dev'/'test'; negative = any word not in the implant list "
                                            "(and not in --stop_list). Scores are recomputed per split from the raw neighbours.",
                         action='store_true')
     args = parser.parse_args()
 
     # --- CHANGE: Split generation mode ---
-    # Boss's step 3: split the master IMPLANT list (all positives) into ref/dev/test.
+    # Split the master IMPLANT list (all positives) into ref/dev/test.
     # The ref list is what tags the stored vectors; dev/test are the query labels.
     if args.make_splits:
         if not args.master_list:
@@ -320,9 +323,9 @@ def main():
     # --- CHANGE: renamed from distances to analysis (vote-based approach) ---
     votes_file = output_dir / f"neigbourhood_analysis_{neighbourhood_hash}.h5"
 
-    # --- CHANGE: boss's exact method (step 5). Labels come from the lists, not the pickles.
+    # List-based labelling. Labels come from the lists, not the pickles.
     # Build a raw neighbour store (query word + neighbour words + distances) once, then
-    # recompute scores per split. ---
+    # recompute scores per split.
     if args.official:
         if not args.splits_file:
             raise ValueError("--official requires --splits-file")
@@ -369,7 +372,7 @@ def main():
 
     # --- CHANGE: Branch on whether splits-file is provided ---
     if not args.splits_file:
-        # Original non-split analysis (boss's code)
+        # Original non-split analysis
         metrics_file = output_dir / "analyzed_neighbourhoods.csv"
         if not metrics_file.exists() or args.recalculate:
             metrics_df = compute_statistics(votes_file, num_workers=args.num_workers)
@@ -504,8 +507,14 @@ def report_split_results(all_split_results, all_split_info, output_dir):
               f"{row.get('dev_roc_auc', float('nan')):>8.4f}")
     print("-"*90)
 
-    # Aggregated stats with bootstrapped CI
+    # Aggregated stats with bootstrapped CI.
+    # Include any precision@k columns that are present so they are summarised too.
     numeric_cols = ['roc_auc', 'dev_roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
+    precision_at_k_cols = sorted(
+        [c for c in results_df.columns if c.startswith('precision_at_')],
+        key=lambda c: int(c.rsplit('_', 1)[1])
+    )
+    numeric_cols = numeric_cols + precision_at_k_cols
     available_cols = [c for c in numeric_cols if c in results_df.columns and results_df[c].notna().any()]
 
     print(f"\n{'='*70}")
@@ -685,7 +694,7 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
 
 
 # ======================================================================
-# --- CHANGE: Boss's exact step-5 method ---
+# List-based labelling method.
 # Labels are derived from the lists (stop list + implant split), NOT from
 # the pickled neighbourhoods. ALL words in the HDF5 are used as the
 # background (negatives). Because a neighbour counts as positive only if
@@ -765,7 +774,7 @@ def build_neighbour_store(neighbourhood_files, store_file, neighbour_limit):
 
 
 def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None):
-    """Boss's exact method (step 5): re-derive labels from the lists.
+    """List-based labelling: re-derive labels from the lists.
 
     For each split:
       - a NEIGHBOUR is positive iff it is in the split's 'ref' implant list;
@@ -923,7 +932,12 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
                 rec = recall_sweep[best_idx]
                 f1_val = f1_sweep[best_idx]
 
-            all_split_results.append({
+            # Precision@k: of the k highest-scored words, the fraction that are
+            # truly positive. This is the meaningful precision for a ranking /
+            # screening tool under heavy class imbalance.
+            order = np.argsort(-test_scores)
+            y_ranked = y_test[order]
+            result = {
                 'split_id': int(split_id),
                 'weight_type': wt,
                 'n_neighbours': n,
@@ -934,14 +948,18 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
                 'recall': rec,
                 'f1': f1_val,
                 'dev_roc_auc': best_dev_auc,
-            })
+            }
+            for k in TOP_K_VALUES:
+                kk = min(k, len(y_ranked))
+                result[f'precision_at_{k}'] = float(y_ranked[:kk].sum()) / kk if kk > 0 else float('nan')
+            all_split_results.append(result)
         except Exception:
             continue
 
     report_split_results(all_split_results, all_split_info, output_dir)
 
 
-# Boss's original record_results — CHANGED: added query_word_lists parameter for storing query words
+# record_results — stores query words alongside classes/votes for split matching
 def record_results(store: h5py.File, query_word_classes, votes, chunk_size, query_word_lists=None):
     concatenated_query_word_classes = np.concatenate(query_word_classes)
     store_query_word_classes = concatenated_query_word_classes[:chunk_size]
@@ -988,7 +1006,7 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     else:
         remaining_query_words = []
 
-    # Boss's original vote flattening and storage
+    # Vote flattening and storage
     flattened_votes = defaultdict(lambda: defaultdict(list))
     for votes_batch in votes:
         for centrality_measures, neighbour_votes in votes_batch.items():
@@ -1031,7 +1049,7 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     if any_remaining_votes:
         remaining_votes.append(remaining_votes_batch)
 
-    # --- CHANGE: write weighting_function attribute (boss's original naming from occ general) ---
+    # Write the weighting_function attribute
     weighting_functions = set(flattened_votes.keys())
     if 'weighting_function' in store.attrs:
         weighting_functions.update(store.attrs['weighting_function'])
@@ -1040,7 +1058,7 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
 
 
-# Boss's original compute_statistics (unchanged except _trapz)
+# compute_statistics for the non-split analysis
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
@@ -1060,7 +1078,7 @@ def compute_statistics(votes_file: Path, num_workers=0):
     return df
 
 
-# Boss's original statistics_worker (unchanged except _trapz)
+# statistics_worker for the non-split analysis
 def statistics_worker(work_package):
     store_file, weight_type, n_neighbours = work_package
     records = []
@@ -1120,7 +1138,7 @@ def statistics_worker(work_package):
     return records
 
 
-# Boss's original get_arrays_for_file — CHANGED: also returns query_words for split matching
+# get_arrays_for_file — also returns query_words for split matching
 def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
     neighbourhood_classes = []
     neighbourhood_distances = []
@@ -1166,8 +1184,7 @@ def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
             "query_words": query_words}  # --- CHANGE: return query_words ---
 
 
-# --- CHANGE: replaced get_central_distance with get_votes from boss's "occ general" script ---
-# This computes weighted sum of positive neighbor class labels instead of mean/median distance
+# get_votes: weighted sum of positive neighbour class labels (vote-based scoring)
 def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
     votes = {}
     for weight_type in ['constant', 'inverse', 'exponential']:
