@@ -677,6 +677,11 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                 f1_val = f1_sweep[best_idx]
                 best_dev_threshold = prc_thresholds[best_idx]
 
+            # Precision@k: of the k highest-scored words, the fraction that are
+            # truly positive. Meaningful precision for a ranking / screening tool.
+            order = np.argsort(-test_scores_sub)
+            y_ranked = np.asarray(classes_test)[order]
+
             result = {
                 'weight_type': weight_type,
                 'n_neighbours': n_neighbours,
@@ -688,6 +693,9 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                 'f1': f1_val,
                 'dev_roc_auc': best_dev_auc,
             }
+            for k in TOP_K_VALUES:
+                kk = min(k, len(y_ranked))
+                result[f'precision_at_{k}'] = float(y_ranked[:kk].sum()) / kk if kk > 0 else float('nan')
             return [result], split_info
         except Exception:
             return None, split_info
