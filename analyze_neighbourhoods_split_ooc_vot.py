@@ -335,7 +335,7 @@ def main():
             if neighbour_limit is None or neighbour_limit < 0:
                 raise RuntimeError(f"Could not determine the neighbourhood limit, got {neighbour_limit}.")
             build_neighbour_store(neighbourhood_files, raw_store, neighbour_limit)
-        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list)
+        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list, neg_ratio=args.neg_ratio)
         return
 
     if args.recalculate or not votes_file.exists():
@@ -781,7 +781,7 @@ def build_neighbour_store(neighbourhood_files, store_file, neighbour_limit):
     print(f"  Saved raw neighbour store to: {store_file}")
 
 
-def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None):
+def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None, neg_ratio=None):
     """List-based labelling: re-derive labels from the lists.
 
     For each split:
@@ -792,8 +792,16 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
       - the weighted vote for a query word = sum over its neighbours of
         weight(distance) * [neighbour in ref].
     Best (weight_type, n_neighbours) is picked on dev, then evaluated on test.
+
+    neg_ratio: if set (e.g. 10), the background negatives are randomly
+    subsampled to neg_ratio * n_positives per split (separately for dev/test),
+    while labels are still derived from the lists. None = keep all negatives.
     """
     print(f"\nRunning OFFICIAL split-based evaluation (labels from lists) using: {splits_file}")
+    if neg_ratio is not None:
+        print(f"  Balancing ON: keeping {neg_ratio} background negatives per positive (list-based labels)")
+    else:
+        print("  Balancing OFF: keeping ALL background negatives")
     with open(splits_file, "r", encoding="utf-8") as fp:
         splits = json.load(fp)
     print(f"Loaded {len(splits)} splits")
@@ -864,8 +872,27 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
         q_in_dev = np.array([qid in dev_ids for qid in query_word_ids], dtype=bool)
         q_in_test = np.array([qid in test_ids for qid in query_word_ids], dtype=bool)
 
-        dev_mask = q_in_dev | base_negative
-        test_mask = q_in_test | base_negative
+        # Background negatives: optionally subsample to neg_ratio * n_positives
+        # per split (labels still come from the lists, not the pickle).
+        if neg_ratio is not None:
+            rng = np.random.default_rng(1234 + int(split_id))
+            neg_idx = np.where(base_negative)[0]
+
+            def sample_neg(n_pos):
+                target = min(len(neg_idx), int(n_pos) * neg_ratio)
+                mask = np.zeros(n_queries, dtype=bool)
+                if target > 0:
+                    mask[rng.choice(neg_idx, size=target, replace=False)] = True
+                return mask
+
+            dev_neg_mask = sample_neg(q_in_dev.sum())
+            test_neg_mask = sample_neg(q_in_test.sum())
+        else:
+            dev_neg_mask = base_negative
+            test_neg_mask = base_negative
+
+        dev_mask = q_in_dev | dev_neg_mask
+        test_mask = q_in_test | test_neg_mask
         y_dev = q_in_dev[dev_mask].astype(np.int8)
         y_test = q_in_test[test_mask].astype(np.int8)
 
@@ -876,11 +903,11 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
             'total_negative_in_data': int(base_negative.sum()),
             'test_matched': int(test_mask.sum()),
             'test_positive': int(q_in_test.sum()),
-            'test_negative': int(base_negative.sum()),
+            'test_negative': int(test_neg_mask.sum()),
             'test_positive_rate': float(q_in_test.sum()) / int(test_mask.sum()) if test_mask.any() else 0.0,
             'dev_matched': int(dev_mask.sum()),
             'dev_positive': int(q_in_dev.sum()),
-            'dev_negative': int(base_negative.sum()),
+            'dev_negative': int(dev_neg_mask.sum()),
         }
         all_split_info.append(split_info)
 
