@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
 # --- CHANGE: numpy >= 2.0 renamed np.trapz to np.trapezoid ---
-_trapz = getattr(np, 'trapezoid', np.trapz)
+_trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
 
 class NeighbourHoodDataset(Dataset):
     def __init__(self, neighbourhood_files, neighbourhood_limit=None):
@@ -41,6 +41,9 @@ def no_tensor_collator(batch):
     return batch
 
 EVAL_METRICS = ('roc_auc', 'precision', 'recall', 'f1', 'average_precision')
+
+# Top-k cut-offs for precision@k reporting (precision among the k highest-scored words).
+TOP_K_VALUES = (50, 100, 200)
 
 
 # --- CHANGE: Added split generation helper ---
@@ -64,7 +67,120 @@ def make_random_split(master_list, n_repeats=10, n_folds=10, seed=42):
     return all_splits
 
 
+# --- CHANGE: Added stratified split generation ---
+# Splits positive and negative words separately, then distributes them
+# proportionally into ref/dev/test so each partition has ~same positive rate
+def make_stratified_split(word_list, class_labels, n_repeats=10, n_folds=10, seed=42, neg_ratio=None):
+    """
+    word_list: list of words (may contain duplicates from multiple pickle files)
+    class_labels: list/array of 0 or 1 for each word
+    neg_ratio: if set, subsample negatives to neg_ratio * n_positives (e.g., 10 = 10 negatives per positive)
+               if None, use all negatives
+    """
+    random.seed(seed)
+
+    # Deduplicate: same word may appear in multiple pickle files
+    # Use majority vote for class label if a word has conflicting labels
+    word_class = {}
+    for w, c in zip(word_list, class_labels):
+        if w not in word_class:
+            word_class[w] = []
+        word_class[w].append(int(c))
+
+    unique_words_with_class = {}
+    for w, classes in word_class.items():
+        unique_words_with_class[w] = 1 if sum(classes) > len(classes) / 2 else 0
+
+    positive_words = [w for w, c in unique_words_with_class.items() if c == 1]
+    negative_words = [w for w, c in unique_words_with_class.items() if c == 0]
+
+    total_unique = len(positive_words) + len(negative_words)
+    print(f"  Total rows: {len(word_list)}")
+    print(f"  Unique words: {total_unique}")
+    print(f"  Before balancing: {len(positive_words)} positive, {len(negative_words)} negative")
+    print(f"  Original positive rate: {len(positive_words)/total_unique:.4%}")
+
+    # --- CHANGE: subsample negatives to reduce class imbalance ---
+    if neg_ratio is not None and len(negative_words) > len(positive_words) * neg_ratio:
+        n_neg_target = len(positive_words) * neg_ratio
+        random.shuffle(negative_words)
+        negative_words = negative_words[:n_neg_target]
+        new_total = len(positive_words) + len(negative_words)
+        print(f"  After balancing (neg_ratio={neg_ratio}): {len(positive_words)} positive, {len(negative_words)} negative")
+        print(f"  Balanced positive rate: {len(positive_words)/new_total:.4%}")
+    else:
+        print(f"  No subsampling applied (neg_ratio={neg_ratio})")
+
+    all_splits = {}
+    split_id = 0
+    for r in range(n_repeats):
+        for f in range(n_folds):
+            pos = positive_words[:]
+            neg = negative_words[:]
+            random.shuffle(pos)
+            random.shuffle(neg)
+
+            n_pos = len(pos)
+            n_pos_ref = int(n_pos * 0.80)
+            n_pos_dev = int(n_pos * 0.10)
+
+            n_neg = len(neg)
+            n_neg_ref = int(n_neg * 0.80)
+            n_neg_dev = int(n_neg * 0.10)
+
+            ref = pos[:n_pos_ref] + neg[:n_neg_ref]
+            dev = pos[n_pos_ref:n_pos_ref+n_pos_dev] + neg[n_neg_ref:n_neg_ref+n_neg_dev]
+            test = pos[n_pos_ref+n_pos_dev:] + neg[n_neg_ref+n_neg_dev:]
+
+            random.shuffle(ref)
+            random.shuffle(dev)
+            random.shuffle(test)
+
+            all_splits[split_id] = {
+                "ref": ref,
+                "dev": dev,
+                "test": test
+            }
+            split_id += 1
+
+    # Print stats for first split as sanity check
+    first = all_splits[0]
+    for part_name in ('ref', 'dev', 'test'):
+        part_words = first[part_name]
+        n_pos_in_part = sum(1 for w in part_words if unique_words_with_class.get(w, 0) == 1)
+        n_total_in_part = len(part_words)
+        rate = n_pos_in_part / n_total_in_part if n_total_in_part > 0 else 0
+        print(f"  Split 0 {part_name}: {n_total_in_part} words, {n_pos_in_part} positive ({rate:.4%})")
+
+    return all_splits
+
+
 # --- CHANGE: Added bootstrap CI helper (Erik's suggestion) ---
+# --- CHANGE: step 3a, verify each split has distinct (disjoint) ref/dev/test subsets ---
+def verify_splits_distinct(splits):
+    print(f"\n  Checking {len(splits)} splits for distinct ref/dev/test subsets...")
+    all_ok = True
+    for split_id, parts in splits.items():
+        ref, dev, test = set(parts["ref"]), set(parts["dev"]), set(parts["test"])
+        problems = []
+        if ref & dev:
+            problems.append(f"ref∩dev={len(ref & dev)}")
+        if ref & test:
+            problems.append(f"ref∩test={len(ref & test)}")
+        if dev & test:
+            problems.append(f"dev∩test={len(dev & test)}")
+        if len(parts["ref"]) != len(ref) or len(parts["dev"]) != len(dev) or len(parts["test"]) != len(test):
+            problems.append("duplicates within a subset")
+        if problems:
+            all_ok = False
+            print(f"    Split {split_id}: NOT DISTINCT -> {', '.join(problems)}")
+    if all_ok:
+        print("  OK: every split has distinct ref/dev/test subsets (no overlaps, no duplicates).")
+    else:
+        print("  WARNING: some splits have overlapping/duplicate subsets (see above).")
+    return all_ok
+
+
 def bootstrap_ci(values, n_bootstrap=10000, ci=0.95, seed=42):
     rng = np.random.RandomState(seed)
     n = len(values)
@@ -86,20 +202,119 @@ def main():
     # --- CHANGE: Added split-based evaluation arguments ---
     parser.add_argument('--splits-file', help='Path to the splits JSON file for split-based evaluation.', type=Path)
     parser.add_argument('--make-splits', help='Generate random 80/10/10 splits and exit.', action='store_true')
-    parser.add_argument('--master_list', help='Path to master implant list for split generation.', type=Path)
+    parser.add_argument('--make-stratified-splits', help='Generate stratified 80/10/10 splits (balanced pos/neg ratio) and exit. Uses --master_list and --stop_list to filter words, looks up classes from HDF5.', action='store_true')
+    parser.add_argument('--master_list', help='Path to master word list (one word per line) for split generation.', type=Path)
+    parser.add_argument('--stop_list', help='Path to stop word list (one word per line) to exclude from splits.', type=Path)
+    parser.add_argument('--neg_ratio', help='Subsample negatives: keep this many negatives per positive (e.g., 10). Default=None (use all).', type=int, default=None)
     parser.add_argument('--split_output', help='Where to save generated split JSON.', type=Path, default="implant_splits.json")
+    # List-based labelling mode: labels are derived from the lists, not the pickles.
+    parser.add_argument('--official', help="List-based labelling: neighbour label = word is in the split's 'ref' implant list; "
+                                           "query positive = word is in 'dev'/'test'; negative = any word not in the implant list "
+                                           "(and not in --stop_list). Scores are recomputed per split from the raw neighbours.",
+                        action='store_true')
+    parser.add_argument('--score-mode', dest='score_mode', choices=['vote', 'mindist', 'avgdist'], default='vote',
+                        help="How to score each word from its positive neighbours (--official only): "
+                             "'vote' = weighted count of positive neighbours (default); "
+                             "'mindist' = closeness to the nearest positive neighbour; "
+                             "'avgdist' = closeness to the positive neighbours on average.")
     args = parser.parse_args()
 
     # --- CHANGE: Split generation mode ---
+    # Split the master IMPLANT list (all positives) into ref/dev/test.
+    # The ref list is what tags the stored vectors; dev/test are the query labels.
     if args.make_splits:
         if not args.master_list:
             raise ValueError("Provide --master_list when using --make-splits")
         with open(args.master_list, "r", encoding="utf-8") as fp:
             master_list = [line.strip() for line in fp if line.strip()]
+        # de-duplicate while preserving order
+        master_list = list(dict.fromkeys(master_list))
+        print(f"Master implant list: {len(master_list)} words from {args.master_list}")
+        # remove stop words if a stop list is provided
+        if args.stop_list:
+            with open(args.stop_list, "r", encoding="utf-8") as fp:
+                stop_words = set(line.strip() for line in fp if line.strip())
+            before = len(master_list)
+            master_list = [w for w in master_list if w not in stop_words]
+            print(f"After removing stop words: {len(master_list)} words ({before - len(master_list)} removed)")
         splits = make_random_split(master_list)
+        verify_splits_distinct(splits)
         with open(args.split_output, "w", encoding="utf-8") as fp:
             json.dump(splits, fp, indent=2, ensure_ascii=False)
-        print(f"Saved {len(splits)} splits to: {args.split_output}")
+        print(f"\nSaved {len(splits)} implant-list splits to: {args.split_output}")
+        return
+
+    # --- CHANGE: Stratified split generation mode ---
+    # Uses master_list + stop_list to filter words, looks up classes from HDF5
+    if args.make_stratified_splits:
+        if not args.master_list:
+            raise ValueError("Provide --master_list when using --make-stratified-splits")
+
+        # Read master word list
+        with open(args.master_list, "r", encoding="utf-8") as fp:
+            master_words = set(line.strip() for line in fp if line.strip())
+        print(f"Master list: {len(master_words)} words from {args.master_list}")
+
+        # Read stop list (words to exclude)
+        stop_words = set()
+        if args.stop_list:
+            with open(args.stop_list, "r", encoding="utf-8") as fp:
+                stop_words = set(line.strip() for line in fp if line.strip())
+            print(f"Stop list: {len(stop_words)} words from {args.stop_list}")
+
+        # Filter: keep master words that are NOT in stop list
+        filtered_words = master_words - stop_words
+        removed = master_words & stop_words
+        print(f"After removing stop words: {len(filtered_words)} words ({len(removed)} removed)")
+
+        # Look up class labels from HDF5
+        output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
+        h5_files = list(output_dir.glob("neigbourhood_analysis_*.h5"))
+        if not h5_files:
+            h5_files = list(output_dir.glob("neigbourhood_distances_*.h5"))
+        if not h5_files:
+            raise FileNotFoundError(f"No HDF5 file found in {output_dir}. Run without --make-stratified-splits first.")
+        h5_file = h5_files[0]
+        print(f"Looking up word classes from: {h5_file}")
+        with h5py.File(h5_file, 'r') as store:
+            h5_classes = store['query_word_classes'][:]
+            if 'query_words' not in store:
+                raise RuntimeError("HDF5 missing 'query_words'. Re-run with --recalculate.")
+            raw_qwords = store['query_words'][:]
+            h5_words = [w.decode('utf-8') if isinstance(w, bytes) else w for w in raw_qwords]
+
+        # Build word->class mapping from HDF5 (majority vote for duplicates)
+        word_class_votes = {}
+        for w, c in zip(h5_words, h5_classes):
+            if w not in word_class_votes:
+                word_class_votes[w] = []
+            word_class_votes[w].append(int(c))
+        word_to_class = {w: (1 if sum(cs) > len(cs)/2 else 0) for w, cs in word_class_votes.items()}
+
+        # Match filtered words to HDF5 classes
+        matched_words = []
+        matched_classes = []
+        not_found = []
+        for w in sorted(filtered_words):
+            if w in word_to_class:
+                matched_words.append(w)
+                matched_classes.append(word_to_class[w])
+            else:
+                not_found.append(w)
+
+        print(f"Matched {len(matched_words)} words to HDF5 data")
+        if not_found:
+            print(f"  ({len(not_found)} words from master list not found in HDF5, skipped)")
+
+        splits = make_stratified_split(matched_words, matched_classes, neg_ratio=args.neg_ratio)
+
+        # --- CHANGE: verify each split has distinct ref/dev/test subsets (step 3a) ---
+        verify_splits_distinct(splits)
+
+        out_path = args.split_output
+        with open(out_path, "w", encoding="utf-8") as fp:
+            json.dump(splits, fp, indent=2, ensure_ascii=False)
+        print(f"\nSaved {len(splits)} stratified splits to: {out_path}")
         return
 
     neighbourhood_files = sorted(args.neighbourhoods.glob("*.pkl"))
@@ -110,7 +325,23 @@ def main():
     neighbourhood_hash = neighbourhood_hash.hexdigest()
     output_dir = args.output_dir if args.output_dir else args.neighbourhoods / "analysis"
     output_dir.mkdir(exist_ok=True, parents=True)
-    votes_file = output_dir / f"neigbourhood_distances_{neighbourhood_hash}.h5"
+    # --- CHANGE: renamed from distances to analysis (vote-based approach) ---
+    votes_file = output_dir / f"neigbourhood_analysis_{neighbourhood_hash}.h5"
+
+    # List-based labelling. Labels come from the lists, not the pickles.
+    # Build a raw neighbour store (query word + neighbour words + distances) once, then
+    # recompute scores per split.
+    if args.official:
+        if not args.splits_file:
+            raise ValueError("--official requires --splits-file")
+        raw_store = output_dir / f"neighbour_raw_{neighbourhood_hash}.h5"
+        if args.recalculate or not raw_store.exists():
+            neighbour_limit = get_neighbourhood_limit(neighbourhood_files, num_workers=args.num_workers)
+            if neighbour_limit is None or neighbour_limit < 0:
+                raise RuntimeError(f"Could not determine the neighbourhood limit, got {neighbour_limit}.")
+            build_neighbour_store(neighbourhood_files, raw_store, neighbour_limit)
+        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list, neg_ratio=args.neg_ratio, score_mode=args.score_mode)
+        return
 
     if args.recalculate or not votes_file.exists():
         partial_file: Path = votes_file.with_suffix('.tmp')
@@ -132,8 +363,9 @@ def main():
                     n_batch_words = len(batch_query_word_classes)
                     n_words += n_batch_words
                     query_word_classes.append(batch_query_word_classes)
-                    batch_distances = example['distances']
-                    votes.append(batch_distances)
+                    # --- CHANGE: use 'votes' (weighted positive counts) instead of 'distances' ---
+                    batch_votes = example['votes']
+                    votes.append(batch_votes)
                     # --- CHANGE: collect query words ---
                     query_word_lists.append(example.get('query_words', []))
                     if n_words >= args.chunk_size:
@@ -145,7 +377,7 @@ def main():
 
     # --- CHANGE: Branch on whether splits-file is provided ---
     if not args.splits_file:
-        # Original non-split analysis (boss's code)
+        # Original non-split analysis
         metrics_file = output_dir / "analyzed_neighbourhoods.csv"
         if not metrics_file.exists() or args.recalculate:
             metrics_df = compute_statistics(votes_file, num_workers=args.num_workers)
@@ -214,6 +446,11 @@ def run_split_evaluation(votes_file, splits_file, output_dir):
                 result['split_id'] = int(split_id)
             all_split_results.extend(split_results)
 
+    report_split_results(all_split_results, all_split_info, output_dir)
+
+
+# --- CHANGE: shared reporting/aggregation used by both split evaluators ---
+def report_split_results(all_split_results, all_split_info, output_dir):
     # Print split diagnostic info
     if all_split_info:
         info_df = pd.DataFrame(all_split_info)
@@ -275,8 +512,14 @@ def run_split_evaluation(votes_file, splits_file, output_dir):
               f"{row.get('dev_roc_auc', float('nan')):>8.4f}")
     print("-"*90)
 
-    # Aggregated stats with bootstrapped CI
+    # Aggregated stats with bootstrapped CI.
+    # Include any precision@k columns that are present so they are summarised too.
     numeric_cols = ['roc_auc', 'dev_roc_auc', 'precision', 'recall', 'f1', 'average_precision', 'threshold']
+    precision_at_k_cols = sorted(
+        [c for c in results_df.columns if c.startswith('precision_at_')],
+        key=lambda c: int(c.rsplit('_', 1)[1])
+    )
+    numeric_cols = numeric_cols + precision_at_k_cols
     available_cols = [c for c in numeric_cols if c in results_df.columns and results_df[c].notna().any()]
 
     print(f"\n{'='*70}")
@@ -315,9 +558,12 @@ def run_split_evaluation(votes_file, splits_file, output_dir):
     for metric in ['roc_auc', 'precision', 'recall', 'f1', 'average_precision']:
         if metric not in results_df.columns:
             continue
+        metric_values = results_df[metric].dropna()
+        if metric_values.empty:
+            continue
         plt.figure(figsize=(8, 5))
-        plt.hist(results_df[metric], bins=20, edgecolor='black', alpha=0.7)
-        mean_val = results_df[metric].mean()
+        plt.hist(metric_values, bins=20, edgecolor='black', alpha=0.7)
+        mean_val = metric_values.mean()
         plt.axvline(mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
         plt.xlabel(metric)
         plt.ylabel("Count")
@@ -370,10 +616,10 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if not test_mask.any():
             return None, split_info
 
-        # Collect all configs (same structure as boss's code: centrality_measures × n_neighbours)
-        centrality_measures = store.attrs.get('centrality_measures', [])
+        # Collect all configs (weighting_function × n_neighbours)
+        weighting_functions = store.attrs.get('weighting_function', [])
         approach_configs = []
-        for weight_type in centrality_measures:
+        for weight_type in weighting_functions:
             g = store[weight_type]
             for nn in g.attrs['n_neighbours']:
                 approach_configs.append((weight_type, nn))
@@ -387,7 +633,8 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
         if use_dev:
             for weight_type, n_neighbours in approach_configs:
                 try:
-                    dev_scores = np.exp(-store[weight_type][str(n_neighbours)][:])
+                    # --- CHANGE: use votes directly, no exp(-x) transform ---
+                    dev_scores = store[weight_type][str(n_neighbours)][:]
                     dev_scores_sub = dev_scores[dev_mask]
                     fpr, tpr, roc_thresh = roc_curve(classes_dev, dev_scores_sub)
                     dev_auc = _trapz(tpr, fpr)
@@ -411,8 +658,8 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
 
         weight_type, n_neighbours = best_dev_config
         try:
-            # Boss's scoring: exp(-distance)
-            test_scores = np.exp(-store[weight_type][str(n_neighbours)][:])
+            # --- CHANGE: use votes directly, no exp(-x) transform ---
+            test_scores = store[weight_type][str(n_neighbours)][:]
             test_scores_sub = test_scores[test_mask]
 
             fpr, tpr, roc_thresholds = roc_curve(classes_test, test_scores_sub)
@@ -435,6 +682,11 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                 f1_val = f1_sweep[best_idx]
                 best_dev_threshold = prc_thresholds[best_idx]
 
+            # Precision@k: of the k highest-scored words, the fraction that are
+            # truly positive. Meaningful precision for a ranking / screening tool.
+            order = np.argsort(-test_scores_sub)
+            y_ranked = np.asarray(classes_test)[order]
+
             result = {
                 'weight_type': weight_type,
                 'n_neighbours': n_neighbours,
@@ -446,12 +698,335 @@ def compute_statistics_with_split(votes_file, ref_words, dev_words, test_words, 
                 'f1': f1_val,
                 'dev_roc_auc': best_dev_auc,
             }
+            for k in TOP_K_VALUES:
+                kk = min(k, len(y_ranked))
+                result[f'precision_at_{k}'] = float(y_ranked[:kk].sum()) / kk if kk > 0 else float('nan')
             return [result], split_info
         except Exception:
             return None, split_info
 
 
-# Boss's original record_results — CHANGED: added query_word_lists parameter for storing query words
+# ======================================================================
+# List-based labelling method.
+# Labels are derived from the lists (stop list + implant split), NOT from
+# the pickled neighbourhoods. ALL words in the HDF5 are used as the
+# background (negatives). Because a neighbour counts as positive only if
+# it is in the split's "ref" implant list, the scores must be recomputed
+# for every split. To make that feasible we store the raw neighbours once
+# (query word + neighbour words as vocab IDs + distances) and recompute
+# the weighted votes per split.
+# ======================================================================
+def build_neighbour_store(neighbourhood_files, store_file, neighbour_limit):
+    """Read the pickles once and store, per unique query word:
+        - the query word (as a vocab id),
+        - its first `neighbour_limit` neighbour words (as vocab ids),
+        - the matching neighbour distances.
+    The stored words let us re-derive labels from the lists at eval time."""
+    print(f"\nBuilding raw neighbour store (neighbour_limit={neighbour_limit})...")
+    word_to_id = {}
+
+    def wid(word):
+        i = word_to_id.get(word)
+        if i is None:
+            i = len(word_to_id)
+            word_to_id[word] = i
+        return i
+
+    seen_query = set()
+    query_ids = []
+    neigh_ids = []
+    neigh_dists = []
+
+    for neighbourhood_file in tqdm(neighbourhood_files, desc="Reading neighbourhoods"):
+        with open(neighbourhood_file, 'rb') as fp:
+            neighbourhood_data = pickle.load(fp)
+        neighbourhoods = neighbourhood_data["neighbourhoods"]
+
+        for (query_word, query_label), neighbours in neighbourhoods:
+            # one row per unique query word (word-level evaluation)
+            if query_word in seen_query:
+                continue
+            nb = neighbours[:neighbour_limit]
+            if len(nb) < neighbour_limit:
+                continue  # keep rows uniform-length
+            seen_query.add(query_word)
+            query_ids.append(wid(query_word))
+            ids_row = np.empty(neighbour_limit, dtype=np.int64)
+            dist_row = np.empty(neighbour_limit, dtype=np.float32)
+            for j, (cossim, neighbour_word, neighbour_label) in enumerate(nb):
+                ids_row[j] = wid(neighbour_word)
+                dist_row[j] = cossim
+            neigh_ids.append(ids_row)
+            neigh_dists.append(dist_row)
+
+    query_ids = np.array(query_ids, dtype=np.int64)
+    if neigh_ids:
+        neigh_ids = np.vstack(neigh_ids)
+        neigh_dists = np.vstack(neigh_dists)
+    else:
+        neigh_ids = np.zeros((0, neighbour_limit), dtype=np.int64)
+        neigh_dists = np.zeros((0, neighbour_limit), dtype=np.float32)
+
+    vocab = np.empty(len(word_to_id), dtype=object)
+    for word, i in word_to_id.items():
+        vocab[i] = word
+
+    print(f"  Unique query words: {len(query_ids)}")
+    print(f"  Vocabulary size (query + neighbour words): {len(vocab)}")
+
+    partial = store_file.with_suffix('.tmp')
+    string_dt = h5py.string_dtype(encoding='utf-8')
+    with h5py.File(partial, 'w') as store:
+        store.create_dataset('vocab', data=vocab, dtype=string_dt)
+        store.create_dataset('query_word_ids', data=query_ids)
+        store.create_dataset('neighbour_ids', data=neigh_ids)
+        store.create_dataset('neighbour_distances', data=neigh_dists)
+        store.attrs['neighbour_limit'] = int(neighbour_limit)
+    partial.rename(store_file)
+    print(f"  Saved raw neighbour store to: {store_file}")
+
+
+def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None, neg_ratio=None, score_mode='vote'):
+    """List-based labelling: re-derive labels from the lists.
+
+    For each split:
+      - a NEIGHBOUR is positive iff it is in the split's 'ref' implant list;
+      - a QUERY word is positive iff it is in 'dev' (stage 1) / 'test' (stage 2);
+      - a QUERY word is negative iff it is NOT in any implant list AND not in
+        the stop list (all remaining HDF5 words form the background);
+      - the weighted vote for a query word = sum over its neighbours of
+        weight(distance) * [neighbour in ref].
+    Best (weight_type, n_neighbours) is picked on dev, then evaluated on test.
+
+    neg_ratio: if set (e.g. 10), the background negatives are randomly
+    subsampled to neg_ratio * n_positives per split (separately for dev/test),
+    while labels are still derived from the lists. None = keep all negatives.
+    """
+    print(f"\nRunning OFFICIAL split-based evaluation (labels from lists) using: {splits_file}")
+    print(f"  Score mode: {score_mode}  "
+          f"({'weighted count of positive neighbours' if score_mode == 'vote' else 'distance to nearest positive' if score_mode == 'mindist' else 'average distance to positive neighbours'})")
+    if neg_ratio is not None:
+        print(f"  Balancing ON: keeping {neg_ratio} background negatives per positive (list-based labels)")
+    else:
+        print("  Balancing OFF: keeping ALL background negatives")
+    with open(splits_file, "r", encoding="utf-8") as fp:
+        splits = json.load(fp)
+    print(f"Loaded {len(splits)} splits")
+
+    with h5py.File(store_file, 'r') as store:
+        raw_vocab = store['vocab'][:]
+        query_word_ids = store['query_word_ids'][:]
+        neighbour_ids = store['neighbour_ids'][:]
+        neighbour_distances = store['neighbour_distances'][:]
+        neighbour_limit = int(store.attrs['neighbour_limit'])
+
+    vocab = [w.decode('utf-8') if isinstance(w, (bytes, np.bytes_)) else str(w) for w in raw_vocab]
+    word2id = {w: i for i, w in enumerate(vocab)}
+    vocab_size = len(vocab)
+    n_queries = len(query_word_ids)
+    print(f"  Unique query words (all HDF5 background): {n_queries}")
+    print(f"  Vocabulary size: {vocab_size}")
+
+    def ids_for(words):
+        s = set()
+        for w in words:
+            i = word2id.get(w)
+            if i is not None:
+                s.add(i)
+        return s
+
+    # Stop-list ids
+    stop_ids = set()
+    if stop_list_file:
+        with open(stop_list_file, "r", encoding="utf-8") as fp:
+            stop_ids = ids_for(line.strip() for line in fp if line.strip())
+    print(f"  Stop words present in vocab: {len(stop_ids)}")
+
+    # Master implant ids = union of ref/dev/test across all splits.
+    master_ids = set()
+    for parts in splits.values():
+        for key in ('ref', 'dev', 'test'):
+            master_ids |= ids_for(parts[key])
+    print(f"  Master implant words present in vocab: {len(master_ids)}")
+
+    # Precompute per-query helper arrays (constant across splits).
+    is_master_q = np.array([qid in master_ids for qid in query_word_ids], dtype=bool)
+    is_stop_q = np.array([qid in stop_ids for qid in query_word_ids], dtype=bool)
+    # background negatives: not an implant (any split) and not a stop word
+    base_negative = (~is_master_q) & (~is_stop_q)
+    print(f"  Background negatives (non-implant, non-stop): {int(base_negative.sum())}")
+
+    # Precompute neighbour weights per weight_type (distances are fixed).
+    weight_types = ['constant', 'inverse', 'exponential']
+    weights = {wt: weighting_function(neighbour_distances, weight_type=wt) for wt in weight_types}
+    n_neighbours_list = list(range(1, neighbour_limit + 1))
+
+    all_split_results = []
+    all_split_info = []
+
+    is_ref = np.zeros(vocab_size, dtype=bool)
+    for split_id, parts in tqdm(splits.items(), desc="Evaluating splits"):
+        ref_ids = ids_for(parts['ref'])
+        dev_ids = ids_for(parts['dev'])
+        test_ids = ids_for(parts['test'])
+
+        # neighbour positive mask for this split (ref tags the vectors)
+        is_ref[:] = False
+        if ref_ids:
+            is_ref[list(ref_ids)] = True
+        neighbour_is_ref = is_ref[neighbour_ids]  # (n_queries, neighbour_limit) bool
+
+        q_in_dev = np.array([qid in dev_ids for qid in query_word_ids], dtype=bool)
+        q_in_test = np.array([qid in test_ids for qid in query_word_ids], dtype=bool)
+
+        # Background negatives: optionally subsample to neg_ratio * n_positives
+        # per split (labels still come from the lists, not the pickle).
+        if neg_ratio is not None:
+            rng = np.random.default_rng(1234 + int(split_id))
+            neg_idx = np.where(base_negative)[0]
+
+            def sample_neg(n_pos):
+                target = min(len(neg_idx), int(n_pos) * neg_ratio)
+                mask = np.zeros(n_queries, dtype=bool)
+                if target > 0:
+                    mask[rng.choice(neg_idx, size=target, replace=False)] = True
+                return mask
+
+            dev_neg_mask = sample_neg(q_in_dev.sum())
+            test_neg_mask = sample_neg(q_in_test.sum())
+        else:
+            dev_neg_mask = base_negative
+            test_neg_mask = base_negative
+
+        dev_mask = q_in_dev | dev_neg_mask
+        test_mask = q_in_test | test_neg_mask
+        y_dev = q_in_dev[dev_mask].astype(np.int8)
+        y_test = q_in_test[test_mask].astype(np.int8)
+
+        split_info = {
+            'split_id': int(split_id),
+            'total_words_in_data': n_queries,
+            'total_positive_in_data': int(is_master_q.sum()),
+            'total_negative_in_data': int(base_negative.sum()),
+            'test_matched': int(test_mask.sum()),
+            'test_positive': int(q_in_test.sum()),
+            'test_negative': int(test_neg_mask.sum()),
+            'test_positive_rate': float(q_in_test.sum()) / int(test_mask.sum()) if test_mask.any() else 0.0,
+            'dev_matched': int(dev_mask.sum()),
+            'dev_positive': int(q_in_dev.sum()),
+            'dev_negative': int(dev_neg_mask.sum()),
+        }
+        all_split_info.append(split_info)
+
+        if not test_mask.any() or len(np.unique(y_test)) < 2:
+            continue
+
+        # Build the per-query score for the chosen scoring mode (all reuse the
+        # same stored neighbours + cosine distances; higher score = more
+        # implant-like). 'vote' = weighted count of positive neighbours;
+        # 'mindist' = closeness to the nearest positive neighbour;
+        # 'avgdist' = closeness to the positive neighbours on average.
+        if score_mode == 'vote':
+            score_cache = {wt: np.cumsum(weights[wt] * neighbour_is_ref, axis=1)
+                           for wt in weight_types}
+            wt_options = weight_types
+        else:
+            pos_dist = np.where(neighbour_is_ref, neighbour_distances, np.inf)
+            if score_mode == 'mindist':
+                cum_min = np.minimum.accumulate(pos_dist, axis=1)
+            else:  # avgdist
+                cum_cnt = np.cumsum(neighbour_is_ref, axis=1)
+                cum_dsum = np.cumsum(np.where(neighbour_is_ref, neighbour_distances, 0.0), axis=1)
+            wt_options = ['distance']
+
+        def score_vec(wt, n):
+            if score_mode == 'vote':
+                return score_cache[wt][:, n - 1]
+            if score_mode == 'mindist':
+                s = -cum_min[:, n - 1]                 # closer positive -> higher score
+                s[~np.isfinite(s)] = -1e9              # no positive neighbour in top-n
+                return s
+            cnt = cum_cnt[:, n - 1]                     # avgdist
+            with np.errstate(invalid='ignore', divide='ignore'):
+                avg = cum_dsum[:, n - 1] / cnt
+            s = -avg
+            s[cnt == 0] = -1e9
+            return s
+
+        # Stage 1: pick best (weight_type, n_neighbours) on dev.
+        best_dev_auc = -1.0
+        best_dev_config = None
+        best_dev_threshold = 0.0
+        for wt in wt_options:
+            if len(np.unique(y_dev)) < 2:
+                continue
+            for n in n_neighbours_list:
+                scores_dev = score_vec(wt, n)[dev_mask]
+                try:
+                    fpr, tpr, roc_thresh = roc_curve(y_dev, scores_dev)
+                    dev_auc = _trapz(tpr, fpr)
+                except Exception:
+                    continue
+                if dev_auc > best_dev_auc:
+                    best_dev_auc = dev_auc
+                    best_dev_config = (wt, n)
+                    youdens_j = tpr - fpr
+                    best_dev_threshold = roc_thresh[np.argmax(youdens_j)]
+
+        if best_dev_config is None:
+            best_dev_config = (wt_options[0], neighbour_limit)
+            best_dev_auc = float('nan')
+            best_dev_threshold = 0.0
+
+        # Stage 2: evaluate best config on test.
+        wt, n = best_dev_config
+        test_scores = score_vec(wt, n)[test_mask]
+        try:
+            fpr, tpr, _ = roc_curve(y_test, test_scores)
+            roc_auc = _trapz(tpr, fpr)
+            precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(y_test, test_scores)
+            ap = -np.sum(np.diff(recall_sweep) * precision_sweep[:-1])
+
+            discretized = test_scores > best_dev_threshold
+            if discretized.any() and not discretized.all():
+                prec = precision_score(y_test, discretized, zero_division=0)
+                rec = recall_score(y_test, discretized, zero_division=0)
+                f1_val = f1_score(y_test, discretized, zero_division=0)
+            else:
+                f1_sweep = 2 * precision_sweep[:-1] * recall_sweep[:-1] / (precision_sweep[:-1] + recall_sweep[:-1] + 1e-12)
+                best_idx = int(np.argmax(f1_sweep))
+                prec = precision_sweep[best_idx]
+                rec = recall_sweep[best_idx]
+                f1_val = f1_sweep[best_idx]
+
+            # Precision@k: of the k highest-scored words, the fraction that are
+            # truly positive. This is the meaningful precision for a ranking /
+            # screening tool under heavy class imbalance.
+            order = np.argsort(-test_scores)
+            y_ranked = y_test[order]
+            result = {
+                'split_id': int(split_id),
+                'weight_type': wt,
+                'n_neighbours': n,
+                'roc_auc': roc_auc,
+                'average_precision': ap,
+                'threshold': best_dev_threshold,
+                'precision': prec,
+                'recall': rec,
+                'f1': f1_val,
+                'dev_roc_auc': best_dev_auc,
+            }
+            for k in TOP_K_VALUES:
+                kk = min(k, len(y_ranked))
+                result[f'precision_at_{k}'] = float(y_ranked[:kk].sum()) / kk if kk > 0 else float('nan')
+            all_split_results.append(result)
+        except Exception:
+            continue
+
+    report_split_results(all_split_results, all_split_info, output_dir)
+
+
+# record_results — stores query words alongside classes/votes for split matching
 def record_results(store: h5py.File, query_word_classes, votes, chunk_size, query_word_lists=None):
     concatenated_query_word_classes = np.concatenate(query_word_classes)
     store_query_word_classes = concatenated_query_word_classes[:chunk_size]
@@ -498,7 +1073,7 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     else:
         remaining_query_words = []
 
-    # Boss's original vote flattening and storage
+    # Vote flattening and storage
     flattened_votes = defaultdict(lambda: defaultdict(list))
     for votes_batch in votes:
         for centrality_measures, neighbour_votes in votes_batch.items():
@@ -541,21 +1116,21 @@ def record_results(store: h5py.File, query_word_classes, votes, chunk_size, quer
     if any_remaining_votes:
         remaining_votes.append(remaining_votes_batch)
 
-    # --- CHANGE: write centrality_measures attribute ---
-    centrality_measures = set(flattened_votes.keys())
-    if 'centrality_measures' in store.attrs:
-        centrality_measures.update(store.attrs['centrality_measures'])
-    store.attrs['centrality_measures'] = sorted(centrality_measures)
+    # Write the weighting_function attribute
+    weighting_functions = set(flattened_votes.keys())
+    if 'weighting_function' in store.attrs:
+        weighting_functions.update(store.attrs['weighting_function'])
+    store.attrs['weighting_function'] = sorted(weighting_functions)
 
     return n_remaining, remaining_word_classes, remaining_votes, remaining_query_words
 
 
-# Boss's original compute_statistics (unchanged except _trapz)
+# compute_statistics for the non-split analysis
 def compute_statistics(votes_file: Path, num_workers=0):
     work_packages = []
     with h5py.File(votes_file, 'r') as store:
-        centrality_measures = store.attrs['centrality_measures']
-        for weight_type in centrality_measures:
+        weighting_functions = store.attrs['weighting_function']
+        for weight_type in weighting_functions:
             g = store[weight_type]
             all_n_neighbours = g.attrs['n_neighbours']
             for n_neighbours in all_n_neighbours:
@@ -570,7 +1145,7 @@ def compute_statistics(votes_file: Path, num_workers=0):
     return df
 
 
-# Boss's original statistics_worker (unchanged except _trapz)
+# statistics_worker for the non-split analysis
 def statistics_worker(work_package):
     store_file, weight_type, n_neighbours = work_package
     records = []
@@ -578,8 +1153,8 @@ def statistics_worker(work_package):
         query_word_classes = store['query_word_classes'][:]
         positive_words = int(np.sum(query_word_classes))
         negative_words = len(query_word_classes) - positive_words
-        # Boss's scoring: exp(-distance)
-        votes = np.exp(-store[weight_type][str(n_neighbours)][:])
+        # --- CHANGE: use votes directly (weighted positive neighbor counts), no exp(-x) transform ---
+        votes = store[weight_type][str(n_neighbours)][:]
         fpr, tpr, roc_thresholds = roc_curve(query_word_classes, votes)
         roc_auc = _trapz(tpr, fpr)
         precision_sweep, recall_sweep, prc_thresholds = precision_recall_curve(query_word_classes, votes)
@@ -630,7 +1205,7 @@ def statistics_worker(work_package):
     return records
 
 
-# Boss's original get_arrays_for_file — CHANGED: also returns query_words for split matching
+# get_arrays_for_file — also returns query_words for split matching
 def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
     neighbourhood_classes = []
     neighbourhood_distances = []
@@ -668,22 +1243,26 @@ def get_arrays_for_file(neighbourhood_file, neighbourhood_limit=-1):
         raise RuntimeError("Array lengths differs")
 
     n_neighbours = list(range(1, neighbourhood_limit+1))
-    distances = get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours)
+    # --- CHANGE: use get_votes (weighted positive counts) instead of get_central_distance ---
+    votes = get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours)
 
     return {"query_word_classes": query_word_classes,
-            "distances": distances,
+            "votes": votes,
             "query_words": query_words}  # --- CHANGE: return query_words ---
 
 
-# Boss's original (unchanged)
-def get_central_distance(neighbourhood_classes, neighbourhood_distances, n_neighbours):
-    distances = {}
-    for measure, measure_fun in [('mean', np.mean), ('median', np.median)]:
-        distance_per_neighbourhood = {}
+# get_votes: weighted sum of positive neighbour class labels (vote-based scoring)
+def get_votes(neighbourhood_classes, neighbourhood_distances, n_neighbours):
+    votes = {}
+    for weight_type in ['constant', 'inverse', 'exponential']:
+        weight_type_votes = {}
+        neighbour_weights = weighting_function(neighbourhood_distances, weight_type=weight_type)
+        neighbour_weighted_classes = neighbour_weights * neighbourhood_classes
+        neighbour_cumsums = np.cumsum(neighbour_weighted_classes, axis=1)
         for i in n_neighbours:
-            distance_per_neighbourhood[i] = measure_fun(neighbourhood_distances[:, :i], axis=1)
-        distances[measure] = distance_per_neighbourhood
-    return distances
+            weight_type_votes[i] = neighbour_cumsums[:, i-1]
+        votes[weight_type] = weight_type_votes
+    return votes
 
 
 # Boss's original (unchanged)
