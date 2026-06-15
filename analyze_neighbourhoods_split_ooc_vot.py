@@ -212,6 +212,11 @@ def main():
                                            "query positive = word is in 'dev'/'test'; negative = any word not in the implant list "
                                            "(and not in --stop_list). Scores are recomputed per split from the raw neighbours.",
                         action='store_true')
+    parser.add_argument('--score-mode', dest='score_mode', choices=['vote', 'mindist', 'avgdist'], default='vote',
+                        help="How to score each word from its positive neighbours (--official only): "
+                             "'vote' = weighted count of positive neighbours (default); "
+                             "'mindist' = closeness to the nearest positive neighbour; "
+                             "'avgdist' = closeness to the positive neighbours on average.")
     args = parser.parse_args()
 
     # --- CHANGE: Split generation mode ---
@@ -335,7 +340,7 @@ def main():
             if neighbour_limit is None or neighbour_limit < 0:
                 raise RuntimeError(f"Could not determine the neighbourhood limit, got {neighbour_limit}.")
             build_neighbour_store(neighbourhood_files, raw_store, neighbour_limit)
-        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list, neg_ratio=args.neg_ratio)
+        run_split_evaluation_official(raw_store, args.splits_file, output_dir, stop_list_file=args.stop_list, neg_ratio=args.neg_ratio, score_mode=args.score_mode)
         return
 
     if args.recalculate or not votes_file.exists():
@@ -781,7 +786,7 @@ def build_neighbour_store(neighbourhood_files, store_file, neighbour_limit):
     print(f"  Saved raw neighbour store to: {store_file}")
 
 
-def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None, neg_ratio=None):
+def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list_file=None, neg_ratio=None, score_mode='vote'):
     """List-based labelling: re-derive labels from the lists.
 
     For each split:
@@ -798,6 +803,8 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
     while labels are still derived from the lists. None = keep all negatives.
     """
     print(f"\nRunning OFFICIAL split-based evaluation (labels from lists) using: {splits_file}")
+    print(f"  Score mode: {score_mode}  "
+          f"({'weighted count of positive neighbours' if score_mode == 'vote' else 'distance to nearest positive' if score_mode == 'mindist' else 'average distance to positive neighbours'})")
     if neg_ratio is not None:
         print(f"  Balancing ON: keeping {neg_ratio} background negatives per positive (list-based labels)")
     else:
@@ -914,19 +921,47 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
         if not test_mask.any() or len(np.unique(y_test)) < 2:
             continue
 
+        # Build the per-query score for the chosen scoring mode (all reuse the
+        # same stored neighbours + cosine distances; higher score = more
+        # implant-like). 'vote' = weighted count of positive neighbours;
+        # 'mindist' = closeness to the nearest positive neighbour;
+        # 'avgdist' = closeness to the positive neighbours on average.
+        if score_mode == 'vote':
+            score_cache = {wt: np.cumsum(weights[wt] * neighbour_is_ref, axis=1)
+                           for wt in weight_types}
+            wt_options = weight_types
+        else:
+            pos_dist = np.where(neighbour_is_ref, neighbour_distances, np.inf)
+            if score_mode == 'mindist':
+                cum_min = np.minimum.accumulate(pos_dist, axis=1)
+            else:  # avgdist
+                cum_cnt = np.cumsum(neighbour_is_ref, axis=1)
+                cum_dsum = np.cumsum(np.where(neighbour_is_ref, neighbour_distances, 0.0), axis=1)
+            wt_options = ['distance']
+
+        def score_vec(wt, n):
+            if score_mode == 'vote':
+                return score_cache[wt][:, n - 1]
+            if score_mode == 'mindist':
+                s = -cum_min[:, n - 1]                 # closer positive -> higher score
+                s[~np.isfinite(s)] = -1e9              # no positive neighbour in top-n
+                return s
+            cnt = cum_cnt[:, n - 1]                     # avgdist
+            with np.errstate(invalid='ignore', divide='ignore'):
+                avg = cum_dsum[:, n - 1] / cnt
+            s = -avg
+            s[cnt == 0] = -1e9
+            return s
+
         # Stage 1: pick best (weight_type, n_neighbours) on dev.
         best_dev_auc = -1.0
         best_dev_config = None
         best_dev_threshold = 0.0
-        cumsum_cache = {}
-        for wt in weight_types:
-            weighted = weights[wt] * neighbour_is_ref
-            cum = np.cumsum(weighted, axis=1)
-            cumsum_cache[wt] = cum
+        for wt in wt_options:
             if len(np.unique(y_dev)) < 2:
                 continue
             for n in n_neighbours_list:
-                scores_dev = cum[:, n - 1][dev_mask]
+                scores_dev = score_vec(wt, n)[dev_mask]
                 try:
                     fpr, tpr, roc_thresh = roc_curve(y_dev, scores_dev)
                     dev_auc = _trapz(tpr, fpr)
@@ -939,16 +974,13 @@ def run_split_evaluation_official(store_file, splits_file, output_dir, stop_list
                     best_dev_threshold = roc_thresh[np.argmax(youdens_j)]
 
         if best_dev_config is None:
-            best_dev_config = ('constant', neighbour_limit)
+            best_dev_config = (wt_options[0], neighbour_limit)
             best_dev_auc = float('nan')
             best_dev_threshold = 0.0
 
         # Stage 2: evaluate best config on test.
         wt, n = best_dev_config
-        cum = cumsum_cache.get(wt)
-        if cum is None:
-            cum = np.cumsum(weights[wt] * neighbour_is_ref, axis=1)
-        test_scores = cum[:, n - 1][test_mask]
+        test_scores = score_vec(wt, n)[test_mask]
         try:
             fpr, tpr, _ = roc_curve(y_test, test_scores)
             roc_auc = _trapz(tpr, fpr)
