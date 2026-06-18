@@ -78,9 +78,14 @@ def main():
                     help='skip the lexical (string-similarity) feature/method')
     ap.add_argument('--lex-chunk', type=int, default=20000,
                     help='row chunk size for the lexical similarity computation')
+    ap.add_argument('--no-full-sim', action='store_true',
+                    help='skip the full-embedding "distance to ALL implants" methods')
+    ap.add_argument('--topk-all', type=int, default=10,
+                    help='k for votetopk_all (sum of top-k implant similarities)')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
     use_lexical = not args.no_lexical
+    use_full = not args.no_full_sim
 
     ks = [int(x) for x in args.ks.split(',')]
     rng = np.random.default_rng(args.seed)
@@ -122,6 +127,17 @@ def main():
     neg_pool = (~is_implant) & (~is_stop) & have_vec   # candidate negatives
     print(f"  negative pool: {int(neg_pool.sum())}")
 
+    # ---- full-embedding similarity to ALL implants (no top-128 cutoff)
+    full_sim = None
+    gloss_col = {}
+    if use_full:
+        print("Building full query x all-implants similarity (no 128 cutoff) ...")
+        gloss_words = [w for w in implant_all if w in word2vec]
+        gloss_mat = l2norm(lmat[[word2vec[w] for w in gloss_words]])
+        gloss_col = {w: c for c, w in enumerate(gloss_words)}
+        full_sim = qvecs @ gloss_mat.T                 # (Nq, n_gloss) cosine sim
+        print(f"  implants with vectors: {len(gloss_words)}   matrix: {full_sim.shape}")
+
     # ---- lexical (character n-gram) matrix over all query words, once
     q_tfidf = None
     if use_lexical:
@@ -141,6 +157,8 @@ def main():
         return out
 
     methods = ['vote', 'mindist', 'avgdist', 'centroid']
+    if use_full:
+        methods += ['mindist_all', 'avgdist_all', 'votetopk_all']
     if use_lexical:
         methods.append('lexical')
     methods += ['hybrid', 'pu_lr', 'pu_rn']
@@ -172,6 +190,18 @@ def main():
         centroid /= cn
         csim = qvecs @ centroid
 
+        # full-embedding "distance to ALL implants" (no 128 cutoff)
+        mindist_all = avgdist_all = votetopk_all = None
+        if use_full:
+            ref_cols = [gloss_col[w] for w in ref if w in gloss_col]
+            sub = full_sim[:, ref_cols]                  # (Nq, n_ref) cosine sims
+            mindist_all = sub.max(axis=1)
+            avgdist_all = sub.mean(axis=1)
+            kk = min(args.topk_all, sub.shape[1])
+            topk = np.partition(sub, -kk, axis=1)[:, -kk:]
+            votetopk_all = topk.sum(axis=1)
+            del sub, topk
+
         # lexical feature (string similarity to ref implant names)
         lex = lexical_max_to_ref(ref) if use_lexical else None
 
@@ -183,6 +213,8 @@ def main():
 
         # features for the classifiers
         feat_cols = [vote, mindist, avgdist, csim, cnt.astype(np.float32)]
+        if use_full:
+            feat_cols += [mindist_all, avgdist_all, votetopk_all]
         if use_lexical:
             feat_cols.append(lex)
         feats = np.column_stack(feat_cols)
@@ -230,6 +262,10 @@ def main():
             'centroid': csim, 'hybrid': hybrid_all,
             'pu_lr': pu_lr_all, 'pu_rn': pu_rn_all,
         }
+        if use_full:
+            score_map['mindist_all'] = mindist_all
+            score_map['avgdist_all'] = avgdist_all
+            score_map['votetopk_all'] = votetopk_all
         if use_lexical:
             score_map['lexical'] = lex
         for m in methods:
