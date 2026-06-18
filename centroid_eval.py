@@ -100,11 +100,18 @@ def main():
     if args.restrict_h5:
         import h5py
         with h5py.File(args.restrict_h5, 'r') as store:
-            if 'query_words' not in store:
-                raise SystemExit(f"'query_words' not found in {args.restrict_h5}")
-            raw_qw = store['query_words'][:]
+            if 'query_words' in store:
+                raw_qw = store['query_words'][:]
+            elif 'vocab' in store and 'query_word_ids' in store:
+                vocab = store['vocab'][:]
+                qids = store['query_word_ids'][:]
+                raw_qw = vocab[qids]
+            else:
+                raise SystemExit(
+                    f"neither 'query_words' nor 'vocab'+'query_word_ids' found in "
+                    f"{args.restrict_h5}; keys present: {list(store.keys())}")
         restrict = {w.decode('utf-8') if isinstance(w, bytes) else str(w) for w in raw_qw}
-        print(f"  restricting scored vocabulary to {len(restrict)} query_words from {args.restrict_h5}")
+        print(f"  restricting scored vocabulary to {len(restrict)} query words from {args.restrict_h5}")
     elif args.restrict_words:
         with open(args.restrict_words, encoding='utf-8') as f:
             restrict = {ln.split()[0] for ln in f if ln.strip()}
