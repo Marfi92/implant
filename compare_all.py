@@ -30,6 +30,7 @@ import h5py
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 def load_lancedb_vectors(path, table):
@@ -73,8 +74,13 @@ def main():
     ap.add_argument('--ks', default='50,100,200')
     ap.add_argument('--neg-ratio-train', type=int, default=10,
                     help='negatives per positive used to TRAIN the classifier')
+    ap.add_argument('--no-lexical', action='store_true',
+                    help='skip the lexical (string-similarity) feature/method')
+    ap.add_argument('--lex-chunk', type=int, default=20000,
+                    help='row chunk size for the lexical similarity computation')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
+    use_lexical = not args.no_lexical
 
     ks = [int(x) for x in args.ks.split(',')]
     rng = np.random.default_rng(args.seed)
@@ -116,7 +122,28 @@ def main():
     neg_pool = (~is_implant) & (~is_stop) & have_vec   # candidate negatives
     print(f"  negative pool: {int(neg_pool.sum())}")
 
-    methods = ['vote', 'mindist', 'avgdist', 'centroid', 'hybrid', 'pu_lr']
+    # ---- lexical (character n-gram) matrix over all query words, once
+    q_tfidf = None
+    if use_lexical:
+        print("Building lexical character n-gram matrix ...")
+        vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), norm='l2')
+        q_tfidf = vec.fit_transform(qwords)            # (Nq, V) sparse, L2-normed
+        print(f"  lexical features: {q_tfidf.shape[1]}")
+
+    def lexical_max_to_ref(ref_words):
+        """max char-ngram cosine similarity of every query word to any ref word."""
+        ref_tfidf = vec.transform(ref_words)           # (n_ref, V), L2-normed
+        out = np.zeros(Nq, dtype=np.float32)
+        ch = args.lex_chunk
+        for s in range(0, Nq, ch):
+            block = q_tfidf[s:s + ch] @ ref_tfidf.T     # sparse (chunk, n_ref)
+            out[s:s + ch] = np.asarray(block.max(axis=1).todense()).ravel()
+        return out
+
+    methods = ['vote', 'mindist', 'avgdist', 'centroid']
+    if use_lexical:
+        methods.append('lexical')
+    methods += ['hybrid', 'pu_lr', 'pu_rn']
     metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
     results = {m: {mn: [] for mn in metric_names} for m in methods}
 
@@ -145,43 +172,66 @@ def main():
         centroid /= cn
         csim = qvecs @ centroid
 
+        # lexical feature (string similarity to ref implant names)
+        lex = lexical_max_to_ref(ref) if use_lexical else None
+
         # labels
         test_set = set(test)
         test_pos = np.array([w in test_set for w in qwords], dtype=bool) & have_vec
         if not test_pos.any():
             continue
 
-        # training set for PU classifier: ref positives vs sampled negatives
+        # features for the classifiers
+        feat_cols = [vote, mindist, avgdist, csim, cnt.astype(np.float32)]
+        if use_lexical:
+            feat_cols.append(lex)
+        feats = np.column_stack(feat_cols)
+
         pos_train = np.array([i for i in ref_idx], dtype=int)
         neg_pool_idx = np.flatnonzero(neg_pool)
+
+        # --- pu_lr: random unlabeled words as "negatives"
         n_train_neg = min(len(neg_pool_idx), args.neg_ratio_train * len(pos_train))
         train_neg = rng.choice(neg_pool_idx, size=n_train_neg, replace=False)
 
-        feats = np.column_stack([vote, mindist, avgdist, csim,
-                                 cnt.astype(np.float32)])
-        Xtr = np.vstack([feats[pos_train], feats[train_neg]])
-        ytr = np.concatenate([np.ones(len(pos_train)), np.zeros(len(train_neg))])
-        scaler = StandardScaler().fit(Xtr)
-        clf = LogisticRegression(max_iter=1000, class_weight='balanced')
-        clf.fit(scaler.transform(Xtr), ytr)
+        # --- pu_rn: RELIABLE negatives = unlabeled words LEAST similar to implants
+        #     (lowest centroid similarity) -> cleaner negative set ("two-step" PU)
+        csim_neg = csim[neg_pool_idx]
+        order_neg = np.argsort(csim_neg)            # ascending: least similar first
+        rn_neg = neg_pool_idx[order_neg[:n_train_neg]]
 
-        # evaluation universe: test positives + negatives NOT used in training
-        train_neg_set = set(train_neg.tolist())
-        eval_neg = np.array([i for i in neg_pool_idx if i not in train_neg_set], dtype=int)
+        def fit_clf(neg_idx):
+            Xtr = np.vstack([feats[pos_train], feats[neg_idx]])
+            ytr = np.concatenate([np.ones(len(pos_train)), np.zeros(len(neg_idx))])
+            sc = StandardScaler().fit(Xtr)
+            c = LogisticRegression(max_iter=1000, class_weight='balanced')
+            c.fit(sc.transform(Xtr), ytr)
+            return sc, c
+
+        sc_lr, clf_lr = fit_clf(train_neg)
+        sc_rn, clf_rn = fit_clf(rn_neg)
+
+        # evaluation universe: test positives + negatives NOT used for training
+        # (exclude any word used as a training negative by EITHER classifier)
+        used_neg = set(train_neg.tolist()) | set(rn_neg.tolist())
+        eval_neg = np.array([i for i in neg_pool_idx if i not in used_neg], dtype=int)
         eval_idx = np.concatenate([np.flatnonzero(test_pos), eval_neg])
         y = np.concatenate([np.ones(int(test_pos.sum())), np.zeros(len(eval_neg))]).astype(int)
 
-        # hybrid: z-normalise vote and centroid over the eval set, then sum
         def z(a):
             m, s = a.mean(), a.std()
             return (a - m) / (s if s > 0 else 1.0)
-        hybrid_all = z(vote) + z(csim)
-        pu_all = clf.predict_proba(scaler.transform(feats))[:, 1]
+        hybrid_all = z(vote) + z(csim) + (z(lex) if use_lexical else 0.0)
+        pu_lr_all = clf_lr.predict_proba(sc_lr.transform(feats))[:, 1]
+        pu_rn_all = clf_rn.predict_proba(sc_rn.transform(feats))[:, 1]
 
         score_map = {
             'vote': vote, 'mindist': mindist, 'avgdist': avgdist,
-            'centroid': csim, 'hybrid': hybrid_all, 'pu_lr': pu_all,
+            'centroid': csim, 'hybrid': hybrid_all,
+            'pu_lr': pu_lr_all, 'pu_rn': pu_rn_all,
         }
+        if use_lexical:
+            score_map['lexical'] = lex
         for m in methods:
             s = score_map[m][eval_idx]
             order = np.argsort(-s, kind='stable')
