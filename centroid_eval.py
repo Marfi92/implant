@@ -55,6 +55,14 @@ def main():
     ap.add_argument('--table', default='words_aggregated')
     ap.add_argument('--splits-file', required=True)
     ap.add_argument('--stop_list', dest='stop_list', default=None)
+    ap.add_argument('--restrict-words', dest='restrict_words', default=None,
+                    help='optional file (one word per line) limiting the scored '
+                         'vocabulary to these words -- use the query-words list '
+                         'from the vote method to make precision@k comparable.')
+    ap.add_argument('--restrict-h5', dest='restrict_h5', default=None,
+                    help="optional neighbour_raw_*.h5 store; limits the scored "
+                         "vocabulary to its 'query_words' -- this is the exact "
+                         "vocabulary the vote method used, so precision@k matches.")
     ap.add_argument('--ks', default='50,100,200', help='comma-separated k for precision@k')
     args = ap.parse_args()
 
@@ -88,10 +96,35 @@ def main():
     first = split_items[0][1]
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
 
-    words_arr = np.array(words, dtype=object)
+    restrict = None
+    if args.restrict_h5:
+        import h5py
+        with h5py.File(args.restrict_h5, 'r') as store:
+            if 'query_words' in store:
+                raw_qw = store['query_words'][:]
+            elif 'vocab' in store and 'query_word_ids' in store:
+                vocab = store['vocab'][:]
+                qids = store['query_word_ids'][:]
+                raw_qw = vocab[qids]
+            else:
+                raise SystemExit(
+                    f"neither 'query_words' nor 'vocab'+'query_word_ids' found in "
+                    f"{args.restrict_h5}; keys present: {list(store.keys())}")
+        restrict = {w.decode('utf-8') if isinstance(w, bytes) else str(w) for w in raw_qw}
+        print(f"  restricting scored vocabulary to {len(restrict)} query words from {args.restrict_h5}")
+    elif args.restrict_words:
+        with open(args.restrict_words, encoding='utf-8') as f:
+            restrict = {ln.split()[0] for ln in f if ln.strip()}
+        print(f"  restricting scored vocabulary to {len(restrict)} words from {args.restrict_words}")
+
     is_implant = np.array([w in implant_all for w in words], dtype=bool)
     is_stop = np.array([w in stop for w in words], dtype=bool)
     neg_mask = (~is_implant) & (~is_stop)     # constant across splits
+    if restrict is not None:
+        in_restrict = np.array([w in restrict for w in words], dtype=bool)
+    else:
+        in_restrict = np.ones(len(words), dtype=bool)
+    neg_mask = neg_mask & in_restrict         # negatives limited to the restrict vocab
     print(f"  negatives (non-implant, non-stop): {int(neg_mask.sum())}")
 
     metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
@@ -113,6 +146,9 @@ def main():
 
         test_pos = np.zeros(len(words), dtype=bool)
         test_pos[test_idx] = True
+        test_pos = test_pos & in_restrict     # positives limited to the restrict vocab too
+        if not test_pos.any():
+            continue
         mask = test_pos | neg_mask
         y = test_pos[mask].astype(int)
         s = scores[mask]
