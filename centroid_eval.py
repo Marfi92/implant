@@ -55,6 +55,10 @@ def main():
     ap.add_argument('--table', default='words_aggregated')
     ap.add_argument('--splits-file', required=True)
     ap.add_argument('--stop_list', dest='stop_list', default=None)
+    ap.add_argument('--restrict-words', dest='restrict_words', default=None,
+                    help='optional file (one word per line) limiting the scored '
+                         'vocabulary to these words -- use the query-words list '
+                         'from the vote method to make precision@k comparable.')
     ap.add_argument('--ks', default='50,100,200', help='comma-separated k for precision@k')
     args = ap.parse_args()
 
@@ -88,10 +92,18 @@ def main():
     first = split_items[0][1]
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
 
-    words_arr = np.array(words, dtype=object)
+    restrict = None
+    if args.restrict_words:
+        with open(args.restrict_words, encoding='utf-8') as f:
+            restrict = {ln.split()[0] for ln in f if ln.strip()}
+        print(f"  restricting scored vocabulary to {len(restrict)} words from {args.restrict_words}")
+
     is_implant = np.array([w in implant_all for w in words], dtype=bool)
     is_stop = np.array([w in stop for w in words], dtype=bool)
     neg_mask = (~is_implant) & (~is_stop)     # constant across splits
+    if restrict is not None:
+        in_restrict = np.array([w in restrict for w in words], dtype=bool)
+        neg_mask = neg_mask & in_restrict     # negatives limited to the restrict vocab
     print(f"  negatives (non-implant, non-stop): {int(neg_mask.sum())}")
 
     metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
