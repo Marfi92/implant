@@ -59,6 +59,10 @@ def main():
                     help='optional file (one word per line) limiting the scored '
                          'vocabulary to these words -- use the query-words list '
                          'from the vote method to make precision@k comparable.')
+    ap.add_argument('--restrict-h5', dest='restrict_h5', default=None,
+                    help="optional neighbour_raw_*.h5 store; limits the scored "
+                         "vocabulary to its 'query_words' -- this is the exact "
+                         "vocabulary the vote method used, so precision@k matches.")
     ap.add_argument('--ks', default='50,100,200', help='comma-separated k for precision@k')
     args = ap.parse_args()
 
@@ -93,7 +97,15 @@ def main():
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
 
     restrict = None
-    if args.restrict_words:
+    if args.restrict_h5:
+        import h5py
+        with h5py.File(args.restrict_h5, 'r') as store:
+            if 'query_words' not in store:
+                raise SystemExit(f"'query_words' not found in {args.restrict_h5}")
+            raw_qw = store['query_words'][:]
+        restrict = {w.decode('utf-8') if isinstance(w, bytes) else str(w) for w in raw_qw}
+        print(f"  restricting scored vocabulary to {len(restrict)} query_words from {args.restrict_h5}")
+    elif args.restrict_words:
         with open(args.restrict_words, encoding='utf-8') as f:
             restrict = {ln.split()[0] for ln in f if ln.strip()}
         print(f"  restricting scored vocabulary to {len(restrict)} words from {args.restrict_words}")
@@ -103,7 +115,9 @@ def main():
     neg_mask = (~is_implant) & (~is_stop)     # constant across splits
     if restrict is not None:
         in_restrict = np.array([w in restrict for w in words], dtype=bool)
-        neg_mask = neg_mask & in_restrict     # negatives limited to the restrict vocab
+    else:
+        in_restrict = np.ones(len(words), dtype=bool)
+    neg_mask = neg_mask & in_restrict         # negatives limited to the restrict vocab
     print(f"  negatives (non-implant, non-stop): {int(neg_mask.sum())}")
 
     metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
@@ -125,6 +139,9 @@ def main():
 
         test_pos = np.zeros(len(words), dtype=bool)
         test_pos[test_idx] = True
+        test_pos = test_pos & in_restrict     # positives limited to the restrict vocab too
+        if not test_pos.any():
+            continue
         mask = test_pos | neg_mask
         y = test_pos[mask].astype(int)
         s = scores[mask]
