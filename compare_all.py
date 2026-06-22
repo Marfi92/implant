@@ -74,6 +74,14 @@ def main():
     ap.add_argument('--ks', default='50,100,200')
     ap.add_argument('--neg-ratio-train', type=int, default=10,
                     help='negatives per positive used to TRAIN the classifier')
+    ap.add_argument('--use-all-neg', action='store_true',
+                    help='train on ALL pool negatives (no subsampling); makes '
+                         'pu_rn identical to pu_lr')
+    ap.add_argument('--no-class-weight', action='store_true',
+                    help='do NOT use class_weight=balanced (use natural imbalance)')
+    ap.add_argument('--eval-full-pool', action='store_true',
+                    help='evaluate on the FULL negative pool (include words used '
+                         'as training negatives) to match the standalone runs')
     ap.add_argument('--no-lexical', action='store_true',
                     help='skip the lexical (string-similarity) feature/method')
     ap.add_argument('--lex-chunk', type=int, default=20000,
@@ -86,6 +94,7 @@ def main():
     args = ap.parse_args()
     use_lexical = not args.no_lexical
     use_full = not args.no_full_sim
+    class_weight = None if args.no_class_weight else 'balanced'
 
     ks = [int(x) for x in args.ks.split(',')]
     rng = np.random.default_rng(args.seed)
@@ -222,9 +231,13 @@ def main():
         pos_train = np.array([i for i in ref_idx], dtype=int)
         neg_pool_idx = np.flatnonzero(neg_pool)
 
-        # --- pu_lr: random unlabeled words as "negatives"
-        n_train_neg = min(len(neg_pool_idx), args.neg_ratio_train * len(pos_train))
-        train_neg = rng.choice(neg_pool_idx, size=n_train_neg, replace=False)
+        # --- pu_lr: unlabeled words as "negatives"
+        if args.use_all_neg:
+            n_train_neg = len(neg_pool_idx)
+            train_neg = neg_pool_idx
+        else:
+            n_train_neg = min(len(neg_pool_idx), args.neg_ratio_train * len(pos_train))
+            train_neg = rng.choice(neg_pool_idx, size=n_train_neg, replace=False)
 
         # --- pu_rn: RELIABLE negatives = unlabeled words LEAST similar to implants
         #     (lowest centroid similarity) -> cleaner negative set ("two-step" PU)
@@ -236,17 +249,21 @@ def main():
             Xtr = np.vstack([feats[pos_train], feats[neg_idx]])
             ytr = np.concatenate([np.ones(len(pos_train)), np.zeros(len(neg_idx))])
             sc = StandardScaler().fit(Xtr)
-            c = LogisticRegression(max_iter=1000, class_weight='balanced')
+            c = LogisticRegression(max_iter=1000, class_weight=class_weight)
             c.fit(sc.transform(Xtr), ytr)
             return sc, c
 
         sc_lr, clf_lr = fit_clf(train_neg)
         sc_rn, clf_rn = fit_clf(rn_neg)
 
-        # evaluation universe: test positives + negatives NOT used for training
-        # (exclude any word used as a training negative by EITHER classifier)
-        used_neg = set(train_neg.tolist()) | set(rn_neg.tolist())
-        eval_neg = np.array([i for i in neg_pool_idx if i not in used_neg], dtype=int)
+        # evaluation universe: test positives + negatives.
+        # By default exclude any word used as a training negative by EITHER
+        # classifier; --eval-full-pool keeps the full pool (matches standalone runs).
+        if args.eval_full_pool:
+            eval_neg = neg_pool_idx
+        else:
+            used_neg = set(train_neg.tolist()) | set(rn_neg.tolist())
+            eval_neg = np.array([i for i in neg_pool_idx if i not in used_neg], dtype=int)
         eval_idx = np.concatenate([np.flatnonzero(test_pos), eval_neg])
         y = np.concatenate([np.ones(int(test_pos.sum())), np.zeros(len(eval_neg))]).astype(int)
 
