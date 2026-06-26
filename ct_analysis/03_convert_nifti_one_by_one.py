@@ -73,18 +73,15 @@ def find_dicom_files_for_series(example_file: str, series_uid: str) -> list:
     # The series folder is typically the parent of the example file
     series_folder = example_path.parent
 
-    # Collect all DICOM files in this folder
+    # Collect all DICOM files in this folder (handles files without DICM preamble)
     dicom_files = []
     for f in series_folder.iterdir():
         if f.is_file():
             try:
-                with open(f, "rb") as fh:
-                    pre = fh.read(132)
-                if len(pre) == 132 and pre[128:132] == b"DICM":
-                    # Verify it belongs to the same series
-                    ds = pydicom.dcmread(str(f), stop_before_pixels=True, force=True)
-                    if getattr(ds, "SeriesInstanceUID", "") == series_uid:
-                        dicom_files.append(f)
+                # Try reading with pydicom (force=True handles missing preamble)
+                ds = pydicom.dcmread(str(f), stop_before_pixels=True, force=True)
+                if getattr(ds, "SeriesInstanceUID", "") == series_uid:
+                    dicom_files.append(f)
             except Exception:
                 pass
 

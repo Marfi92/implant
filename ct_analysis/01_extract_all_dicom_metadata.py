@@ -33,11 +33,18 @@ OUT_SUMMARY = OUT_DIR / "dicom_series_summary.xlsx"
 # DICOM detection
 # ============================================================
 def is_dicom(path: Path) -> bool:
-    """Check if file is DICOM by reading the 128-byte preamble + 'DICM' magic."""
+    """Check if file is DICOM. Handles files WITHOUT the standard DICM preamble
+    (common in SCAPIS and many clinical PACS exports)."""
     try:
+        # First try standard preamble check
         with open(path, "rb") as f:
             pre = f.read(132)
-        return len(pre) == 132 and pre[128:132] == b"DICM"
+        if len(pre) == 132 and pre[128:132] == b"DICM":
+            return True
+
+        # Fallback: try reading with pydicom (force=True handles missing preamble)
+        pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
+        return True
     except Exception:
         return False
 
@@ -185,7 +192,8 @@ def scan_all_data():
         print(f"  - {sf.name}")
     print()
 
-    # Scan all files
+    # Scan all files — try to read each file directly with pydicom (force=True)
+    # This avoids double-reading since SCAPIS DICOMs lack the DICM preamble
     all_records = []
     total_files = 0
     total_dicoms = 0
@@ -199,13 +207,11 @@ def scan_all_data():
                 continue
             total_files += 1
 
-            if is_dicom(f):
+            # Try to extract directly (combines detection + extraction)
+            record = extract_all_tags(f, site_folder.name)
+            if "error" not in record:
                 total_dicoms += 1
                 folder_dicoms += 1
-
-                # For efficiency: only read first file per directory fully
-                # (read every file for complete metadata)
-                record = extract_all_tags(f, site_folder.name)
                 all_records.append(record)
 
                 if total_dicoms % 500 == 0:
