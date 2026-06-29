@@ -226,7 +226,7 @@ def main():
             feat_cols += [mindist_all, avgdist_all, votetopk_all]
         if use_lexical:
             feat_cols.append(lex)
-        feats = np.column_stack(feat_cols)
+        feats = np.nan_to_num(np.column_stack(feat_cols), nan=0.0)
 
         pos_train = np.array([i for i in ref_idx], dtype=int)
         neg_pool_idx = np.flatnonzero(neg_pool)
@@ -249,8 +249,9 @@ def main():
             Xtr = np.vstack([feats[pos_train], feats[neg_idx]])
             ytr = np.concatenate([np.ones(len(pos_train)), np.zeros(len(neg_idx))])
             sc = StandardScaler().fit(Xtr)
+            Xtr_s = np.nan_to_num(sc.transform(Xtr), nan=0.0)
             c = LogisticRegression(max_iter=1000, class_weight=class_weight)
-            c.fit(sc.transform(Xtr), ytr)
+            c.fit(Xtr_s, ytr)
             return sc, c
 
         sc_lr, clf_lr = fit_clf(train_neg)
@@ -271,8 +272,8 @@ def main():
             m, s = a.mean(), a.std()
             return (a - m) / (s if s > 0 else 1.0)
         hybrid_all = z(vote) + z(csim) + (z(lex) if use_lexical else 0.0)
-        pu_lr_all = clf_lr.predict_proba(sc_lr.transform(feats))[:, 1]
-        pu_rn_all = clf_rn.predict_proba(sc_rn.transform(feats))[:, 1]
+        pu_lr_all = clf_lr.predict_proba(np.nan_to_num(sc_lr.transform(feats), nan=0.0))[:, 1]
+        pu_rn_all = clf_rn.predict_proba(np.nan_to_num(sc_rn.transform(feats), nan=0.0))[:, 1]
 
         score_map = {
             'vote': vote, 'mindist': mindist, 'avgdist': avgdist,
