@@ -1,5 +1,14 @@
-curl -O https://raw.githubusercontent.com/Marfi92/implant/devin/1779873435-fix-hdf5-unicode-dtype/check_models.py
-curl -O https://raw.githubusercontent.com/Marfi92/implant/devin/1779873435-fix-hdf5-unicode-dtype/run_all_models.py
+python3 analyze_neighbourhoods_split_ooc_vot.py \
+  /home/abragam23/federatedhealth_20250617/results_nov12_2025/2f3ecdb8-c55a-46e1-9853-d043448e8d25/local_test_results/vector_database_FL_global_model_10/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods \
+  --official --splits-file /home/abragam23/fedhealth_data/implant_split_official.json --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt
+
+python3 compare_all.py \
+  /home/abragam23/federatedhealth_20250617/results_nov12_2025/2f3ecdb8-c55a-46e1-9853-d043448e8d25/local_test_results/vector_database_FL_global_model_10/lancedb_direct \
+  --store /home/abragam23/federatedhealth_20250617/results_nov12_2025/2f3ecdb8-c55a-46e1-9853-d043448e8d25/local_test_results/vector_database_FL_global_model_10/lancedb_direct-words_aggregated-dev_dataset_split_seed_3312143636-cosine-128-neighbourhoods/analysis/neighbour_raw_*.h5 \
+  --splits-file /home/abragam23/fedhealth_data/implant_split_official.json --stop_list /home/abragam23/fedhealth_data/stop_list_freq_1.txt
+
+
+
 
 
 
