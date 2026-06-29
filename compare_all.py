@@ -271,7 +271,7 @@ def main():
         def z(a):
             m, s = a.mean(), a.std()
             return (a - m) / (s if s > 0 else 1.0)
-        hybrid_all = z(vote) + z(csim) + (z(lex) if use_lexical else 0.0)
+        hybrid_all = np.nan_to_num(z(vote) + z(csim) + (z(lex) if use_lexical else 0.0), nan=0.0)
         pu_lr_all = clf_lr.predict_proba(np.nan_to_num(sc_lr.transform(feats), nan=0.0))[:, 1]
         pu_rn_all = clf_rn.predict_proba(np.nan_to_num(sc_rn.transform(feats), nan=0.0))[:, 1]
 
@@ -287,7 +287,7 @@ def main():
         if use_lexical:
             score_map['lexical'] = lex
         for m in methods:
-            s = score_map[m][eval_idx]
+            s = np.nan_to_num(score_map[m][eval_idx], nan=0.0)
             order = np.argsort(-s, kind='stable')
             y_sorted = y[order]
             results[m]['roc_auc'].append(roc_auc_score(y, s))
