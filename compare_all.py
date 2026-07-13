@@ -41,6 +41,13 @@ def load_lancedb_vectors(path, table):
     vec = tbl['vector'].combine_chunks()
     flat = np.asarray(vec.values, dtype=np.float32)
     mat = flat.reshape(len(words), -1)
+    # some checkpoint exports contain non-finite (inf/-inf) cells; a single bad
+    # reference-implant vector otherwise poisons max/mean similarity for every
+    # word. Replace non-finite values with 0 so scoring stays well-defined.
+    n_bad = int((~np.isfinite(mat)).sum())
+    if n_bad:
+        print(f"  WARNING: {n_bad} non-finite cells in vectors -> set to 0")
+        mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
     return words, mat
 
 
