@@ -288,7 +288,10 @@ def main():
             score_map['lexical'] = lex
         for m in methods:
             s = np.nan_to_num(score_map[m][eval_idx], nan=0.0)
-            order = np.argsort(-s, kind='stable')
+            # random permutation before ranking so tied/constant scores break
+            # ties uniformly at random instead of following the vocabulary order
+            perm = rng.permutation(len(s))
+            order = perm[np.argsort(-s[perm], kind='stable')]
             y_sorted = y[order]
             results[m]['roc_auc'].append(roc_auc_score(y, s))
             results[m]['average_precision'].append(average_precision_score(y, s))
