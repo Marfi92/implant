@@ -64,6 +64,35 @@ def precision_at_k(y_sorted, k):
     return float(y_sorted[:k].sum()) / k
 
 
+def recall_at_k(y_sorted, k):
+    """Recall@k = sensitivity@k = fraction of all positives found in the top k."""
+    k = min(k, len(y_sorted))
+    total_pos = float(y_sorted.sum())
+    if total_pos == 0:
+        return 0.0
+    return float(y_sorted[:k].sum()) / total_pos
+
+
+def specificity_at_k(y_sorted, k):
+    """Specificity@k = fraction of all negatives correctly left out of the top k."""
+    k = min(k, len(y_sorted))
+    total_neg = float((y_sorted == 0).sum())
+    if total_neg == 0:
+        return 0.0
+    tp = float(y_sorted[:k].sum())
+    fp = k - tp                       # negatives wrongly ranked in top k
+    tn = total_neg - fp
+    return tn / total_neg
+
+
+def f1_at_k(y_sorted, k):
+    p = precision_at_k(y_sorted, k)
+    r = recall_at_k(y_sorted, k)
+    if p + r == 0:
+        return 0.0
+    return 2 * p * r / (p + r)
+
+
 def load_set(path):
     if not path:
         return set()
@@ -98,6 +127,8 @@ def main():
     ap.add_argument('--topk-all', type=int, default=10,
                     help='k for votetopk_all (sum of top-k implant similarities)')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--csv-out', default=None,
+                    help='write full metric table (mean and std per method) to this CSV')
     args = ap.parse_args()
     use_lexical = not args.no_lexical
     use_full = not args.no_full_sim
@@ -178,7 +209,10 @@ def main():
     if use_lexical:
         methods.append('lexical')
     methods += ['hybrid', 'pu_lr', 'pu_rn']
-    metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
+    metric_names = ['roc_auc', 'average_precision']
+    for k in ks:
+        metric_names += [f'precision_at_{k}', f'recall_at_{k}',
+                         f'sensitivity_at_{k}', f'specificity_at_{k}', f'f1_at_{k}']
     results = {m: {mn: [] for mn in metric_names} for m in methods}
 
     for sid, sp in split_items:
@@ -304,6 +338,10 @@ def main():
             results[m]['average_precision'].append(average_precision_score(y, s))
             for k in ks:
                 results[m][f'precision_at_{k}'].append(precision_at_k(y_sorted, k))
+                results[m][f'recall_at_{k}'].append(recall_at_k(y_sorted, k))
+                results[m][f'sensitivity_at_{k}'].append(recall_at_k(y_sorted, k))
+                results[m][f'specificity_at_{k}'].append(specificity_at_k(y_sorted, k))
+                results[m][f'f1_at_{k}'].append(f1_at_k(y_sorted, k))
 
     # ---- aggregate + print
     print("\n" + "=" * 78)
@@ -321,6 +359,22 @@ def main():
     print("=" * 78)
     n_used = len(results['vote']['roc_auc'])
     print(f"splits used: {n_used}")
+
+    if args.csv_out:
+        import csv as _csv
+        with open(args.csv_out, 'w', newline='') as f:
+            w = _csv.writer(f)
+            header = ['method']
+            for mn in metric_names:
+                header += [f'{mn}_mean', f'{mn}_std']
+            w.writerow(header)
+            for m in methods:
+                row = [m]
+                for mn in metric_names:
+                    vals = results[m][mn]
+                    row += [f'{np.mean(vals):.4f}', f'{np.std(vals):.4f}']
+                w.writerow(row)
+        print(f"wrote {args.csv_out}")
 
 
 if __name__ == '__main__':
