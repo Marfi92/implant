@@ -31,7 +31,13 @@ SCRIPT_DIR  = Path(__file__).resolve().parent   # where compare_all.py lives
 
 
 def find_models():
-    """Scan RESULTS_DIR and return a list of model dicts."""
+    """Scan RESULTS_DIR and return a list of model dicts.
+
+    Layout-agnostic: for each vector_database_FL_global_model_<N> folder we
+    locate (a) the LanceDB database directory (the parent of a *.lance table)
+    and (b) a neighbour_raw_*.h5 store, preferring an 'analysis_official'
+    variant so results match the official evaluation.
+    """
     models = []
     for uuid_dir in sorted(RESULTS_DIR.iterdir()):
         if not uuid_dir.is_dir():
@@ -39,26 +45,34 @@ def find_models():
         test_dir = uuid_dir / "local_test_results"
         if not test_dir.exists():
             continue
-        for vdb in sorted(test_dir.glob("vector_database_*/lancedb_direct")):
-            parent_name = vdb.parent.name
-            model_num = parent_name.split("model_")[-1] if "model_" in parent_name else "?"
-            # Find neighbourhood dir
-            nbr_dirs = sorted(vdb.parent.glob("*-neighbourhoods"))
-            nbr_dir = nbr_dirs[0] if nbr_dirs else None
-            # Find existing .h5 store
-            h5_store = None
-            if nbr_dir:
-                for search_dir in [nbr_dir / "analysis_official2", nbr_dir / "analysis", nbr_dir]:
-                    if search_dir.exists():
-                        stores = list(search_dir.glob("neighbour_raw_*.h5"))
-                        if stores:
-                            h5_store = stores[0]
-                            break
-            has_pkls = bool(nbr_dir and list(nbr_dir.glob("*.pkl")))
+        for vdb_dir in sorted(test_dir.glob("vector_database_*model_*")):
+            model_num = vdb_dir.name.split("model_")[-1]
+
+            # LanceDB path = parent dir of a *.lance table (prefer words_aggregated.lance)
+            lance_tables = sorted(vdb_dir.rglob("*.lance"))
+            lance_tables.sort(key=lambda p: 0 if "words_aggregated" in p.name else 1)
+            lancedb = lance_tables[0].parent if lance_tables else None
+
+            # neighbour_raw store: prefer the official analysis variant
+            all_stores = sorted(vdb_dir.rglob("neighbour_raw_*.h5"))
+            def _rank(p):
+                s = str(p)
+                if "/analysis_official/" in s:
+                    return 0
+                if "/analysis/" in s:
+                    return 1
+                if "/analysis_official" in s:  # analysis_official2 etc.
+                    return 2
+                return 3
+            all_stores.sort(key=_rank)
+            h5_store = all_stores[0] if all_stores else None
+
+            nbr_dir = h5_store.parent.parent if h5_store else vdb_dir
+            has_pkls = bool(list(vdb_dir.rglob("*.pkl")))
             models.append({
                 'uuid': uuid_dir.name,
                 'model_num': model_num,
-                'lancedb': vdb,
+                'lancedb': lancedb,
                 'nbr_dir': nbr_dir,
                 'h5_store': h5_store,
                 'has_pkls': has_pkls,
@@ -98,12 +112,14 @@ def build_h5_store(model):
 def run_compare(model):
     """Run compare_all.py on one model and capture the output."""
     script = SCRIPT_DIR / "compare_all.py"
+    csv_out = SCRIPT_DIR / f"metrics_model_{model['model_num']}.csv"
     cmd = [
         sys.executable, str(script),
         str(model['lancedb']),
         "--store", str(model['h5_store']),
         "--splits-file", str(SPLITS_FILE),
         "--stop_list", str(STOP_LIST),
+        "--csv-out", str(csv_out),
     ]
     print(f"\n{'='*70}")
     print(f"Running compare_all.py on model_{model['model_num']}")
