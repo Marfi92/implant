@@ -120,6 +120,10 @@ def main():
                          'as training negatives) to match the standalone runs')
     ap.add_argument('--no-lexical', action='store_true',
                     help='skip the lexical (string-similarity) feature/method')
+    ap.add_argument('--dump-weights', default=None,
+                    help='write the learned per-feature logistic-regression '
+                         'weights (mean/std over splits) for pu_lr and pu_rn '
+                         'to this CSV, and print them')
     ap.add_argument('--lex-chunk', type=int, default=20000,
                     help='row chunk size for the lexical similarity computation')
     ap.add_argument('--no-full-sim', action='store_true',
@@ -215,6 +219,13 @@ def main():
                          f'sensitivity_at_{k}', f'specificity_at_{k}', f'f1_at_{k}']
     results = {m: {mn: [] for mn in metric_names} for m in methods}
 
+    feat_names = ['vote', 'mindist', 'avgdist', 'centroid', 'cnt']
+    if use_full:
+        feat_names += ['mindist_all', 'avgdist_all', 'votetopk_all']
+    if use_lexical:
+        feat_names.append('lexical')
+    weight_log = {'pu_lr': [], 'pu_rn': []}
+
     for sid, sp in split_items:
         ref, test = sp['ref'], sp['test']
         ref_set = set(ref)
@@ -297,6 +308,8 @@ def main():
 
         sc_lr, clf_lr = fit_clf(train_neg)
         sc_rn, clf_rn = fit_clf(rn_neg)
+        weight_log['pu_lr'].append(clf_lr.coef_.ravel())
+        weight_log['pu_rn'].append(clf_rn.coef_.ravel())
 
         # evaluation universe: test positives + negatives.
         # By default exclude any word used as a training negative by EITHER
@@ -375,6 +388,36 @@ def main():
                     row += [f'{np.mean(vals):.4f}', f'{np.std(vals):.4f}']
                 w.writerow(row)
         print(f"wrote {args.csv_out}")
+
+    # ---- learned per-feature weights (logistic-regression coefficients)
+    if not weight_log['pu_lr']:
+        return
+    print("\n" + "=" * 78)
+    print("LEARNED FEATURE WEIGHTS (standardized coefficients, mean±std over splits)")
+    print("higher |weight| = feature matters more; sign shows direction")
+    print("=" * 78)
+    print(f"{'feature':<16}{'pu_lr':>22}{'pu_rn':>22}")
+    print("-" * 60)
+    wmeans = {clf: np.mean(np.vstack(w), axis=0) for clf, w in weight_log.items()}
+    wstds = {clf: np.std(np.vstack(w), axis=0) for clf, w in weight_log.items()}
+    for i, fn in enumerate(feat_names):
+        print(f"{fn:<16}"
+              f"{wmeans['pu_lr'][i]:>13.4f}±{wstds['pu_lr'][i]:<7.4f}"
+              f"{wmeans['pu_rn'][i]:>13.4f}±{wstds['pu_rn'][i]:<7.4f}")
+    print("=" * 78)
+
+    if args.dump_weights:
+        import csv as _csv
+        with open(args.dump_weights, 'w', newline='') as f:
+            w = _csv.writer(f)
+            w.writerow(['feature',
+                        'pu_lr_weight_mean', 'pu_lr_weight_std',
+                        'pu_rn_weight_mean', 'pu_rn_weight_std'])
+            for i, fn in enumerate(feat_names):
+                w.writerow([fn,
+                            f'{wmeans["pu_lr"][i]:.4f}', f'{wstds["pu_lr"][i]:.4f}',
+                            f'{wmeans["pu_rn"][i]:.4f}', f'{wstds["pu_rn"][i]:.4f}'])
+        print(f"wrote {args.dump_weights}")
 
 
 if __name__ == '__main__':
