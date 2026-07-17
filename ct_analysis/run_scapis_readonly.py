@@ -29,9 +29,17 @@ def main() -> int:
         print("ERROR: Output must not be inside the read-only source folder.")
         return 2
 
-    analyzer = Path(__file__).with_name("04_build_site_dicom_inventories.py")
-    if not analyzer.is_file():
-        print(f"ERROR: Required analyzer is missing: {analyzer}")
+    current_file = globals().get("__file__")
+    current_folder = Path(current_file).resolve().parent if current_file else Path.cwd()
+    candidates = [
+        current_folder / "04_build_site_dicom_inventories.py",
+        Path.cwd() / "04_build_site_dicom_inventories.py",
+        Path.cwd() / "ct_analysis" / "04_build_site_dicom_inventories.py",
+    ]
+    analyzer = next((path for path in candidates if path.is_file()), None)
+    if analyzer is None:
+        print("ERROR: 04_build_site_dicom_inventories.py was not found.")
+        print("Keep both Python files together or run from the repository folder.")
         return 2
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
