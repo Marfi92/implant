@@ -331,11 +331,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def display_path(path: Path) -> str:
+    text = str(path)
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    if text.startswith("\\\\?\\"):
+        return text[4:]
+    return text
+
+
+def io_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    absolute = os.path.abspath(display_path(path))
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def source_info(path: Path, root: Path) -> SourceInfo:
+    display = Path(display_path(path))
+    display_root = Path(display_path(root))
     try:
-        parts = path.relative_to(root).parts
+        parts = display.relative_to(display_root).parts
     except ValueError:
-        parts = path.parts
+        parts = display.parts
 
     for part in parts:
         match = SITE_FOLDER_RE.match(part)
@@ -350,12 +372,15 @@ def source_info(path: Path, root: Path) -> SourceInfo:
 
 
 def iter_files(root: Path, output: Path, limit: int = 0) -> Iterator[Path]:
-    output_resolved = output.resolve()
+    output_resolved = os.path.normcase(os.path.abspath(display_path(output)))
     yielded = 0
-    for current, dirs, files in os.walk(root):
+    for current, dirs, files in os.walk(io_path(root)):
         current_path = Path(current)
         dirs[:] = [
-            name for name in dirs if (current_path / name).resolve() != output_resolved
+            name
+            for name in dirs
+            if os.path.normcase(os.path.abspath(display_path(current_path / name)))
+            != output_resolved
         ]
         for filename in files:
             yield current_path / filename
@@ -462,19 +487,19 @@ def scan_file(path: Path, root: Path, keep_all_tags: bool) -> ScanResult:
             defer_size=1024,
         )
         if not has_dicom_identity(dataset, has_preamble):
-            return ScanResult("not_dicom", str(path), source=source)
+            return ScanResult("not_dicom", display_path(path), source=source)
 
         record: dict[str, object] = {column: "" for column in FILE_COLUMNS}
         record.update(
             {
-                "file_path": str(path),
+                "file_path": display_path(path),
                 "file_size": stat.st_size,
                 "modified_ns": stat.st_mtime_ns,
                 "source_folder": source.source_folder,
                 "site_number": source.site_number,
                 "source_protocol": source.protocol,
                 "archive_batch": source.archive_batch,
-                "folder_path": str(path.parent),
+                "folder_path": display_path(path.parent),
             }
         )
         for keyword, column in IMPORTANT_DICOM_FIELDS.items():
@@ -495,7 +520,7 @@ def scan_file(path: Path, root: Path, keep_all_tags: bool) -> ScanResult:
                     str(record["study_uid"]),
                     str(record["patient_id"]),
                     str(record["series_number"]),
-                    str(path.parent),
+                    display_path(path.parent),
                 ]
             )
             record["series_key"] = f"NO_UID:{fallback}"
@@ -506,14 +531,14 @@ def scan_file(path: Path, root: Path, keep_all_tags: bool) -> ScanResult:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-        return ScanResult("dicom", str(path), record=record, source=source)
+        return ScanResult("dicom", display_path(path), record=record, source=source)
     except Exception as error:
-        return ScanResult("error", str(path), error=str(error), source=source)
+        return ScanResult("error", display_path(path), error=str(error), source=source)
 
 
 def connect_database(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
-    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA journal_mode=DELETE")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA temp_store=MEMORY")
     connection.execute(
@@ -555,7 +580,7 @@ def is_unchanged(connection: sqlite3.Connection, path: Path) -> bool:
         return False
     row = connection.execute(
         "SELECT file_size, modified_ns FROM dicom_files WHERE file_path = ?",
-        (str(path),),
+        (display_path(path),),
     ).fetchone()
     return bool(row and row[0] == stat.st_size and row[1] == stat.st_mtime_ns)
 
