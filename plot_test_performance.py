@@ -27,6 +27,15 @@ def load(path):
     return xs, [dev[x] for x in xs], [test[x] for x in xs]
 
 
+# raw label -> model name by participating sites (A=Abragam, B=DSV, C=nse, D=utu)
+MODEL_NAME = {
+    "model_8":  "Model AB",
+    "model_10": "Model AC",
+    "model_19": "Model ABC",
+    "model_99": "Model ABCD",
+}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inputs", nargs="+", help="path.csv=label")
@@ -37,6 +46,7 @@ def main():
     for item in args.inputs:
         path, _, label = item.partition("=")
         label = label or path
+        label = MODEL_NAME.get(label, label)
         xs, dev, test = load(path)
         runs.append((label, xs, dev, test))
         print(f"{label}: {len(xs)} rounds (0..{max(xs)}), "
