@@ -187,12 +187,18 @@ def main():
             plt.plot(avg_xs, avg_ys, "-", color=colour, lw=1.8,
                      label=f"{name} — avg (all rounds)")
 
-        # dashed: best-so-far global metric (stops at last improving round)
+        # dashed: best-so-far global metric, extended flat to the final round so it
+        # spans the SAME rounds as the average (best-so-far is monotonic: it just
+        # holds its last record-low value once improvements stop).
         if gb:
             xs = [r for r, _ in gb]
             ys = [-v for _, v in gb]
+            last_round = max(avg_xs) if avg_xs else xs[-1]
+            if xs[-1] < last_round:
+                xs = xs + [last_round]
+                ys = ys + [ys[-1]]      # hold last best value flat to the end
             plt.plot(xs, ys, "--", color=colour, lw=1.3, marker="o", ms=3,
-                     label=f"{name} — best-so-far")
+                     label=f"{name} — best-so-far (held flat)")
     plt.xlabel("Federated round")
     plt.ylabel("Loss (= -validation metric; lower = better)")
     plt.title("Global model convergence across rounds\n"
