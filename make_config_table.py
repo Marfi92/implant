@@ -13,12 +13,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # site letters: A=CCO-Abragam, B=DSV, C=nse, D=utu
+# Per-model values verified from run configs via run_all_models.py --config-only.
 MODELS = [
-    # name,        old id,     sites,            rounds_logged, best_round, note
-    ("Model AB",   "model_8",  "A, B",           "0-49",  "~8",  "overfits after round 8"),
-    ("Model AC",   "model_10", "A, C",           "0-49",  "~8",  "flat after round 8"),
-    ("Model ABC",  "model_19", "A, B, C",        "0-49",  "~10", "flat after round 10"),
-    ("Model ABCD", "model_99", "A, B, C, D",     "0-99",  "99",  "still improving, full run"),
+    # name,        old id,     sites,        num_rounds, min_clients, note
+    ("Model AB",   "model_8",  "A, B",       "50",  "2", "2 sites; drift after ~round 8 (heterogeneous/cross-lingual)"),
+    ("Model AC",   "model_10", "A, C",       "50",  "2", "2 sites; flat after ~round 8"),
+    ("Model ABC",  "model_19", "A, B, C",    "50",  "3", "3 sites; flat after ~round 10"),
+    ("Model ABCD", "model_99", "A, B, C, D", "100", "4", "4 sites; keeps improving, full run"),
 ]
 
 # configuration shared by all four runs
@@ -32,30 +33,28 @@ SHARED = [
     ("LoRA dropout",            "0.1"),
     ("LoRA bias",               "all"),
     ("LoRA task type",          "TOKEN_CLS"),
-    ("Learning rate",           "1e-4"),
-    ("Batch size",              "32"),
-    ("Weight decay",            "1e-3"),
-    ("LR scheduler",            "linear"),
-    ("Warmup steps",            "0"),
-    ("Training samples",        "65,536"),
-    ("Evaluation samples",      "4,096"),
+    ("Learning rate (lr)",       "1e-4 (verified)"),
+    ("Weight decay",            "1e-3 (verified)"),
     ("FL workflow",             "Scatter-and-gather"),
     ("Aggregator",              "InTimeAccumulateWeightedAggregator"),
-    ("Local epochs per round",  "1 (aggregation_epochs = 1)"),
-    ("Weighted by local iters", "true"),
-    ("Min clients per round",   "4"),
-    ("Max rounds",              "100"),
-    ("Key metric",              "negated validation loss (negate_key_metric = true)"),
+    ("Local epochs per round",  "1 (aggregation_epochs = 1, verified)"),
+    ("Weighted by local iters", "true (verified)"),
+    ("Key metric",              "negated validation loss (negate_key_metric = true, verified)"),
     ("Checkpoint persistor",    "EveryEpochPersistor (best kept)"),
 ]
+
+# NOTE: num_rounds and min_clients are per-model (see table above), NOT shared:
+#   AB/AC/ABC = 50 rounds; ABCD = 100 rounds. min_clients = number of sites (2/2/3/4).
+# Model AB (model_8) has no train_config.json, so its lr/LoRA/mlm were not saved with
+# the run; they are assumed identical to the other runs (same training script).
 
 # ---- markdown
 lines = ["# Federated training configuration\n",
          "## Per-model summary\n",
-         "| Model | Sites | Rounds logged | Best round | Behaviour |",
+         "| Model | Sites | num_rounds | min_clients | Behaviour |",
          "|---|---|---|---|---|"]
-for name, old, sites, rounds, best, note in MODELS:
-    lines.append(f"| **{name}** ({old}) | {sites} | {rounds} | {best} | {note} |")
+for name, old, sites, rounds, mc, note in MODELS:
+    lines.append(f"| **{name}** ({old}) | {sites} | {rounds} | {mc} | {note} |")
 lines += ["", "Site key: **A** = CCO-Abragam, **B** = DSV, **C** = nse, **D** = utu.",
           "", "## Shared configuration (identical for all four runs)\n",
           "| Parameter | Value |", "|---|---|"]
@@ -72,8 +71,8 @@ for ax in (ax1, ax2):
 
 ax1.set_title("Per-model federated-training summary\n"
               "(A=CCO-Abragam, B=DSV, C=nse, D=utu)", fontsize=12, weight="bold")
-t1 = ax1.table(cellText=[[n, s, r, b, note] for n, o, s, r, b, note in MODELS],
-               colLabels=["Model", "Sites", "Rounds", "Best round", "Behaviour"],
+t1 = ax1.table(cellText=[[n, s, r, mc, note] for n, o, s, r, mc, note in MODELS],
+               colLabels=["Model", "Sites", "num_rounds", "min_clients", "Behaviour"],
                loc="center", cellLoc="center")
 t1.auto_set_font_size(False); t1.set_fontsize(9); t1.scale(1, 1.6)
 
