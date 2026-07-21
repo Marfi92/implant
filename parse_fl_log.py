@@ -26,6 +26,21 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# site -> (letter, fixed colour) so nse is always green, etc. (consistent with plot_per_site.py)
+SITE = {
+    "CCO-Abragam": ("A", "#1f77b4"),  # blue
+    "DSV":         ("B", "#ff7f0e"),  # orange
+    "nse":         ("C", "#2ca02c"),  # green
+    "utu":         ("D", "#d62728"),  # red
+}
+# raw label -> model name by participating sites
+MODEL_NAME = {
+    "model_8":  "Model AB",
+    "model_10": "Model AC",
+    "model_19": "Model ABC",
+    "model_99": "Model ABCD",
+}
+
 RE_METRIC = re.compile(r"validation metric\s+(-?\d+\.?\d*(?:e-?\d+)?)\s+from client\s+(\S+)")
 RE_ACCEPT = re.compile(r"Contribution from\s+(\S+)\s+ACCEPTED by the aggregator at round\s+(\d+)")
 RE_BEST = re.compile(r"new best validation metric at round\s+(\d+):\s+(-?\d+\.?\d*(?:e-?\d+)?)")
@@ -118,16 +133,28 @@ def main():
     lbl = best_entry[1] or best_entry[0]
 
     plt.figure(figsize=(10, 6))
-    for site, seq in sorted(per_site.items()):
+    # plot per-site LOSS (= -metric, lower = better) with fixed site colours/letters
+    for site in sorted(per_site, key=lambda s: SITE.get(s, ("Z", "#000"))[0]):
+        seq = per_site[site]
+        letter, colour = SITE.get(site, (site, None))
         xs = [r for r, _ in seq]
-        ys = [v for _, v in seq]
-        plt.plot(xs, ys, marker="o", ms=3, lw=1, label=f"site: {site}")
-    if gbest:
-        plt.plot([r for r, _ in gbest], [v for _, v in gbest],
-                 color="black", lw=2.2, label="global (aggregated best)")
+        ys = [-v for _, v in seq]  # flip sign -> loss (lower = better)
+        plt.plot(xs, ys, marker="o", ms=3, lw=1, color=colour,
+                 label=f"{letter} ({site})")
+    # black line = average across participating sites per round (spans all rounds)
+    site_round = {s: {r: -v for r, v in seq} for s, seq in per_site.items()}
+    all_rounds = sorted({r for d in site_round.values() for r in d})
+    avg_xs, avg_ys = [], []
+    for r in all_rounds:
+        vals = [site_round[s][r] for s in site_round if r in site_round[s]]
+        if vals:
+            avg_xs.append(r)
+            avg_ys.append(sum(vals) / len(vals))
+    if avg_xs:
+        plt.plot(avg_xs, avg_ys, "k-", lw=2.5, label="average (global)")
     plt.xlabel("Federated round")
-    plt.ylabel("Validation metric (FLARE key metric; higher = better)")
-    plt.title(f"Per-site and global validation metric per round\n{lbl}")
+    plt.ylabel("Validation loss (= -key metric; lower = better)")
+    plt.title(f"Per-site validation loss per round\n{MODEL_NAME.get(lbl, lbl)}")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()

@@ -35,6 +35,32 @@ CONFIG_KEYS = [
     "num_train", "num_eval", "r", "lora_alpha", "lora_dropout", "bias", "task_type",
 ]
 
+# canonical key -> alternative JSON key names seen across runs (train_config vs config_fed_*)
+KEY_ALIASES = {
+    "num_rounds":          ["num_rounds", "n_rounds", "rounds"],
+    "min_clients":         ["min_clients", "min_num_clients"],
+    "aggregation_epochs":  ["aggregation_epochs", "aggr_epochs"],
+    "weigh_by_local_iter": ["weigh_by_local_iter"],
+    "negate_key_metric":   ["negate_key_metric"],
+    "lr":                  ["lr", "learning_rate"],
+    "batch_size":          ["batch_size", "train_batch_size",
+                            "per_device_train_batch_size", "bs"],
+    "weight_decay":        ["weight_decay"],
+    "mlm_probability":     ["mlm_probability", "mlm_prob"],
+    "num_train":           ["num_train", "num_train_samples",
+                            "max_train_samples", "train_size", "n_train"],
+    "num_eval":            ["num_eval", "num_eval_samples", "max_eval_samples",
+                            "eval_size", "n_eval", "num_val"],
+    "r":                   ["r", "lora_r"],
+    "lora_alpha":          ["lora_alpha", "alpha"],
+    "lora_dropout":        ["lora_dropout", "dropout"],
+    "bias":                ["bias"],
+    "task_type":           ["task_type"],
+}
+# reverse map: json key name -> canonical key
+_ALIAS_TO_CANON = {alias: canon for canon, aliases in KEY_ALIASES.items()
+                   for alias in aliases}
+
 # ---- CONFIGURATION (edit these if your paths differ) ----
 RESULTS_DIR = Path("/home/abragam23/federatedhealth_20250617/results_nov12_2025")
 SPLITS_FILE = Path("/home/abragam23/fedhealth_data/implant_split_official.json")
@@ -94,11 +120,13 @@ def find_models():
 
 
 def _walk_json(obj, found):
-    """Recursively collect any CONFIG_KEYS found anywhere in a parsed JSON tree."""
+    """Recursively collect any config parameters (by canonical name or alias)."""
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k in CONFIG_KEYS and not isinstance(v, (dict, list)):
-                found.setdefault(k, v)
+            if not isinstance(v, (dict, list)):
+                canon = _ALIAS_TO_CANON.get(k)
+                if canon:
+                    found.setdefault(canon, v)
             _walk_json(v, found)
     elif isinstance(obj, list):
         for v in obj:
@@ -116,8 +144,13 @@ def read_config(model):
     workspace = run_dir / "workspace"
     cfg = {}
     if workspace.exists():
-        for jf in sorted(workspace.rglob("config_fed_*.json")) + \
-                  sorted(workspace.rglob("*config*.json")):
+        seen_files = []
+        for pat in ("config_fed_*.json", "*config*.json", "train_config.json",
+                    "meta.json"):
+            for jf in sorted(workspace.rglob(pat)):
+                if jf not in seen_files:
+                    seen_files.append(jf)
+        for jf in seen_files:
             try:
                 _walk_json(json.load(open(jf)), cfg)
             except (json.JSONDecodeError, OSError):
