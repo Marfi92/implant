@@ -19,8 +19,21 @@ import argparse
 import subprocess
 import sys
 import os
+import json
+import csv as _csv
+import re
 from pathlib import Path
 from collections import OrderedDict
+
+# site letters (A=CCO-Abragam, B=DSV, C=nse, D=utu)
+SITE_LETTER = {"CCO-Abragam": "A", "DSV": "B", "nse": "C", "utu": "D"}
+
+# config keys we surface, in print order
+CONFIG_KEYS = [
+    "num_rounds", "min_clients", "aggregation_epochs", "weigh_by_local_iter",
+    "negate_key_metric", "lr", "batch_size", "weight_decay", "mlm_probability",
+    "num_train", "num_eval", "r", "lora_alpha", "lora_dropout", "bias", "task_type",
+]
 
 # ---- CONFIGURATION (edit these if your paths differ) ----
 RESULTS_DIR = Path("/home/abragam23/federatedhealth_20250617/results_nov12_2025")
@@ -78,6 +91,82 @@ def find_models():
                 'has_pkls': has_pkls,
             })
     return models
+
+
+def _walk_json(obj, found):
+    """Recursively collect any CONFIG_KEYS found anywhere in a parsed JSON tree."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in CONFIG_KEYS and not isinstance(v, (dict, list)):
+                found.setdefault(k, v)
+            _walk_json(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json(v, found)
+
+
+def read_config(model):
+    """Locate the FLARE config files for a run and extract key parameters + sites.
+
+    Returns a dict of {param: value} plus a 'sites'/'model_name' entry. Reads every
+    JSON under workspace/*/config and merges the values we care about; sites are
+    taken from the client sub-directories under workspace/.
+    """
+    run_dir = RESULTS_DIR / model['uuid']
+    workspace = run_dir / "workspace"
+    cfg = {}
+    if workspace.exists():
+        for jf in sorted(workspace.rglob("config_fed_*.json")) + \
+                  sorted(workspace.rglob("*config*.json")):
+            try:
+                _walk_json(json.load(open(jf)), cfg)
+            except (json.JSONDecodeError, OSError):
+                continue
+    # sites: client folders alongside app_server (exclude server/admin dirs)
+    sites = []
+    if workspace.exists():
+        for d in sorted(workspace.iterdir()):
+            if d.is_dir() and d.name in SITE_LETTER:
+                sites.append(d.name)
+    if not sites:  # fall back to parsing the log
+        log = workspace / "log.txt"
+        if log.exists():
+            seen = set()
+            for line in open(log, encoding="utf-8", errors="replace"):
+                m = re.search(r"from client\s+(\S+)", line)
+                if m and m.group(1) in SITE_LETTER:
+                    seen.add(m.group(1))
+            sites = sorted(seen)
+    cfg['sites'] = ", ".join(sites) if sites else "?"
+    cfg['model_name'] = "Model " + "".join(SITE_LETTER[s] for s in sites) if sites else \
+                        f"model_{model['model_num']}"
+    return cfg
+
+
+def print_all_configs(models):
+    """Print each model's configuration separately and write config_all_models.csv."""
+    print("\n" + "=" * 70)
+    print("PER-MODEL FEDERATED-TRAINING CONFIGURATION")
+    print("(A=CCO-Abragam, B=DSV, C=nse, D=utu)")
+    print("=" * 70)
+    rows = []
+    for m in models:
+        cfg = read_config(m)
+        print(f"\n--- {cfg['model_name']}  (model_{m['model_num']}, {m['uuid'][:12]}...) ---")
+        print(f"  {'sites':<22}: {cfg['sites']}")
+        for k in CONFIG_KEYS:
+            if k in cfg:
+                print(f"  {k:<22}: {cfg[k]}")
+        row = {'model_name': cfg['model_name'], 'model_num': m['model_num'],
+               'sites': cfg['sites']}
+        row.update({k: cfg.get(k, '') for k in CONFIG_KEYS})
+        rows.append(row)
+    out = SCRIPT_DIR / "config_all_models.csv"
+    with open(out, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=['model_name', 'model_num', 'sites'] + CONFIG_KEYS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nwrote {out}")
 
 
 def build_h5_store(model):
@@ -168,6 +257,8 @@ def main():
                     help='Build .h5 neighbour stores where missing (Step 1)')
     ap.add_argument('--models', nargs='+', default=None,
                     help='Only run these model numbers (e.g. --models 8 10 19 99)')
+    ap.add_argument('--config-only', action='store_true',
+                    help='Only print each model configuration, then exit')
     args = ap.parse_args()
 
     print("Scanning for models...")
@@ -184,6 +275,11 @@ def main():
     for m in models:
         status = "READY" if m['h5_store'] else ("can build .h5" if m['has_pkls'] else "needs .pkl files")
         print(f"  model_{m['model_num']} ({m['uuid'][:12]}...): {status}")
+
+    # Print each model's configuration separately (+ config_all_models.csv)
+    print_all_configs(models)
+    if args.config_only:
+        return
 
     # Build missing .h5 stores if requested
     if args.build_stores:
