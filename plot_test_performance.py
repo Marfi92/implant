@@ -34,6 +34,13 @@ MODEL_NAME = {
     "model_19": "Model ABC",
     "model_99": "Model ABCD",
 }
+# fixed colour per model so it is consistent across all figures
+MODEL_COLOR = {
+    "Model AB":   "#1f77b4",  # blue
+    "Model AC":   "#ff7f0e",  # orange
+    "Model ABC":  "#2ca02c",  # green
+    "Model ABCD": "#d62728",  # red
+}
 
 
 def main():
@@ -52,15 +59,29 @@ def main():
         print(f"{label}: {len(xs)} rounds (0..{max(xs)}), "
               f"final test PPL={test[-1]:.3f}, best test PPL={min(test):.3f}")
 
-    # combined test-perplexity convergence
-    plt.figure(figsize=(10, 6))
+    # combined test-perplexity convergence, with each model's BEST (saved) round marked
+    plt.figure(figsize=(11, 6.5))
     for label, xs, dev, test in runs:
-        plt.plot(xs, test, marker="o", ms=3, label=label)
+        colour = MODEL_COLOR.get(label)
+        # best = lowest test perplexity = the checkpoint FLARE actually saves
+        bi = min(range(len(test)), key=lambda i: test[i])
+        best_r, best_p = xs[bi], test[bi]
+        plt.plot(xs, test, marker="o", ms=3, color=colour,
+                 label=f"{label}  (best PPL={best_p:.2f} @ round {best_r}, "
+                       f"trained {max(xs)} rounds)")
+        # star + annotation on the best point = the saved checkpoint
+        plt.plot(best_r, best_p, marker="*", ms=18, color=colour,
+                 markeredgecolor="black", zorder=5)
+        plt.annotate(f"{label.split()[-1]} best\nround {best_r}",
+                     (best_r, best_p), textcoords="offset points",
+                     xytext=(0, -32), ha="center", fontsize=8, color=colour)
     plt.xlabel("Federated round")
     plt.ylabel("Test perplexity (lower = better)")
-    plt.title("Federated MLM convergence: test perplexity per round")
+    plt.title("Federated MLM convergence: test perplexity per round\n"
+              "★ = best round = the checkpoint that is saved and used "
+              "(lines end at each model's trained rounds: 50 or 100)")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(f"{args.out}_test.png", dpi=150)
     print(f"wrote {args.out}_test.png")
