@@ -162,20 +162,42 @@ def main():
     plt.savefig(p1, dpi=150)
     print("wrote", p1)
 
-    # ---- Plot 2: global metric as loss (sign-flipped) for all logs
-    plt.figure(figsize=(10, 6))
-    for path, label in entries:
+    # ---- Plot 2: global convergence as loss (sign-flipped) for all logs.
+    # For each model we draw BOTH:
+    #   - solid line = per-round AVERAGE loss across its sites (spans ALL rounds)
+    #   - dashed line = "best-so-far" global metric (only updates when a new best is found)
+    colours = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    plt.figure(figsize=(11, 6.5))
+    for i, (path, label) in enumerate(entries):
         label = label or path
-        _, gb = parse_log(path)
-        if not gb:
-            continue
-        xs = [r for r, _ in gb]
-        ys = [-v for _, v in gb]  # flip: -metric = loss-like (lower = better)
-        plt.plot(xs, ys, marker="o", ms=3, lw=1.4, label=label)
+        name = MODEL_NAME.get(label, label)
+        colour = colours[i % len(colours)]
+        per_site, gb = parse_log(path)
+
+        # solid: per-round average across sites (every round present)
+        site_round = {s: {r: -v for r, v in seq} for s, seq in per_site.items()}
+        all_rounds = sorted({r for d in site_round.values() for r in d})
+        avg_xs, avg_ys = [], []
+        for r in all_rounds:
+            vals = [site_round[s][r] for s in site_round if r in site_round[s]]
+            if vals:
+                avg_xs.append(r)
+                avg_ys.append(sum(vals) / len(vals))
+        if avg_xs:
+            plt.plot(avg_xs, avg_ys, "-", color=colour, lw=1.8,
+                     label=f"{name} — avg (all rounds)")
+
+        # dashed: best-so-far global metric (stops at last improving round)
+        if gb:
+            xs = [r for r, _ in gb]
+            ys = [-v for _, v in gb]
+            plt.plot(xs, ys, "--", color=colour, lw=1.3, marker="o", ms=3,
+                     label=f"{name} — best-so-far")
     plt.xlabel("Federated round")
     plt.ylabel("Loss (= -validation metric; lower = better)")
-    plt.title("Global model convergence across rounds")
-    plt.legend()
+    plt.title("Global model convergence across rounds\n"
+              "(solid = per-round average over sites; dashed = best-so-far)")
+    plt.legend(fontsize=8, ncol=2)
     plt.grid(alpha=0.3)
     plt.tight_layout()
     p2 = f"{args.out}_global_loss.png"
