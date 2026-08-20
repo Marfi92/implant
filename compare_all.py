@@ -100,6 +100,30 @@ def load_set(path):
         return {ln.split()[0] for ln in f if ln.strip()}
 
 
+def randomise_labels(split_items, qwords, implant_all, stop, rng):
+    """Replace each implant term by a random word from the query vocabulary.
+
+    The mapping is drawn once and reused in every split, so all set sizes and
+    the ref/dev/test structure are preserved; only the identity of the
+    "implants" is destroyed. Words already known to be implants and stop words
+    are excluded from the pool, so a fake positive can never be a real implant.
+    """
+    pool = [w for w in dict.fromkeys(qwords) if w not in implant_all and w not in stop]
+    terms = sorted(implant_all)
+    picked = rng.choice(len(pool), size=len(terms), replace=False)
+    mapping = dict(zip(terms, [pool[i] for i in picked]))
+    print(f"LABEL RANDOMISATION: {len(mapping)} implant terms replaced by "
+          f"random words from a pool of {len(pool)}")
+    print(f"  example: {list(mapping.items())[:3]}")
+
+    def remap(value):
+        if isinstance(value, list):
+            return [mapping[w] for w in value if w in mapping]
+        return value
+
+    return [(sid, {k: remap(v) for k, v in sp.items()}) for sid, sp in split_items]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('lancedb', help='path to lancedb_direct')
@@ -130,6 +154,13 @@ def main():
                     help='skip the full-embedding "distance to ALL implants" methods')
     ap.add_argument('--topk-all', type=int, default=10,
                     help='k for votetopk_all (sum of top-k implant similarities)')
+    ap.add_argument('--randomise-labels', action='store_true',
+                    help='CONTROL: replace every implant term by a random word '
+                         'from the same query vocabulary (same replacement in '
+                         'all splits, so set sizes and the ref/dev/test '
+                         'structure are preserved). All metrics must collapse '
+                         'to chance (roc_auc ~0.5); anything higher indicates '
+                         'leakage in the pipeline')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--csv-out', default=None,
                     help='write full metric table (mean and std per method) to this CSV')
@@ -171,6 +202,11 @@ def main():
     stop = load_set(args.stop_list)
     first = split_items[0][1]
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
+
+    if args.randomise_labels:
+        split_items = randomise_labels(split_items, qwords, implant_all, stop, rng)
+        first = split_items[0][1]
+        implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
 
     qword_to_qidx = {w: i for i, w in enumerate(qwords)}
     is_implant = np.array([w in implant_all for w in qwords], dtype=bool)
