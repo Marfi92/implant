@@ -19,8 +19,47 @@ import argparse
 import subprocess
 import sys
 import os
+import json
+import csv as _csv
+import re
 from pathlib import Path
 from collections import OrderedDict
+
+# site letters (A=CCO-Abragam, B=DSV, C=nse, D=utu)
+SITE_LETTER = {"CCO-Abragam": "A", "DSV": "B", "nse": "C", "utu": "D"}
+
+# config keys we surface, in print order
+CONFIG_KEYS = [
+    "num_rounds", "min_clients", "aggregation_epochs", "weigh_by_local_iter",
+    "negate_key_metric", "lr", "batch_size", "weight_decay", "mlm_probability",
+    "num_train", "num_eval", "r", "lora_alpha", "lora_dropout", "bias", "task_type",
+]
+
+# canonical key -> alternative JSON key names seen across runs (train_config vs config_fed_*)
+KEY_ALIASES = {
+    "num_rounds":          ["num_rounds", "n_rounds", "rounds"],
+    "min_clients":         ["min_clients", "min_num_clients"],
+    "aggregation_epochs":  ["aggregation_epochs", "aggr_epochs"],
+    "weigh_by_local_iter": ["weigh_by_local_iter"],
+    "negate_key_metric":   ["negate_key_metric"],
+    "lr":                  ["lr", "learning_rate"],
+    "batch_size":          ["batch_size", "train_batch_size",
+                            "per_device_train_batch_size", "bs"],
+    "weight_decay":        ["weight_decay"],
+    "mlm_probability":     ["mlm_probability", "mlm_prob"],
+    "num_train":           ["num_train", "num_train_samples",
+                            "max_train_samples", "train_size", "n_train"],
+    "num_eval":            ["num_eval", "num_eval_samples", "max_eval_samples",
+                            "eval_size", "n_eval", "num_val"],
+    "r":                   ["r", "lora_r"],
+    "lora_alpha":          ["lora_alpha", "alpha"],
+    "lora_dropout":        ["lora_dropout", "dropout"],
+    "bias":                ["bias"],
+    "task_type":           ["task_type"],
+}
+# reverse map: json key name -> canonical key
+_ALIAS_TO_CANON = {alias: canon for canon, aliases in KEY_ALIASES.items()
+                   for alias in aliases}
 
 # ---- CONFIGURATION (edit these if your paths differ) ----
 RESULTS_DIR = Path("/home/abragam23/federatedhealth_20250617/results_nov12_2025")
@@ -31,7 +70,13 @@ SCRIPT_DIR  = Path(__file__).resolve().parent   # where compare_all.py lives
 
 
 def find_models():
-    """Scan RESULTS_DIR and return a list of model dicts."""
+    """Scan RESULTS_DIR and return a list of model dicts.
+
+    Layout-agnostic: for each vector_database_FL_global_model_<N> folder we
+    locate (a) the LanceDB database directory (the parent of a *.lance table)
+    and (b) a neighbour_raw_*.h5 store, preferring an 'analysis_official'
+    variant so results match the official evaluation.
+    """
     models = []
     for uuid_dir in sorted(RESULTS_DIR.iterdir()):
         if not uuid_dir.is_dir():
@@ -39,31 +84,122 @@ def find_models():
         test_dir = uuid_dir / "local_test_results"
         if not test_dir.exists():
             continue
-        for vdb in sorted(test_dir.glob("vector_database_*/lancedb_direct")):
-            parent_name = vdb.parent.name
-            model_num = parent_name.split("model_")[-1] if "model_" in parent_name else "?"
-            # Find neighbourhood dir
-            nbr_dirs = sorted(vdb.parent.glob("*-neighbourhoods"))
-            nbr_dir = nbr_dirs[0] if nbr_dirs else None
-            # Find existing .h5 store
-            h5_store = None
-            if nbr_dir:
-                for search_dir in [nbr_dir / "analysis_official2", nbr_dir / "analysis", nbr_dir]:
-                    if search_dir.exists():
-                        stores = list(search_dir.glob("neighbour_raw_*.h5"))
-                        if stores:
-                            h5_store = stores[0]
-                            break
-            has_pkls = bool(nbr_dir and list(nbr_dir.glob("*.pkl")))
+        for vdb_dir in sorted(test_dir.glob("vector_database_*model_*")):
+            model_num = vdb_dir.name.split("model_")[-1]
+
+            # LanceDB path = parent dir of a *.lance table (prefer words_aggregated.lance)
+            lance_tables = sorted(vdb_dir.rglob("*.lance"))
+            lance_tables.sort(key=lambda p: 0 if "words_aggregated" in p.name else 1)
+            lancedb = lance_tables[0].parent if lance_tables else None
+
+            # neighbour_raw store: prefer the official analysis variant
+            all_stores = sorted(vdb_dir.rglob("neighbour_raw_*.h5"))
+            def _rank(p):
+                s = str(p)
+                if "/analysis_official/" in s:
+                    return 0
+                if "/analysis/" in s:
+                    return 1
+                if "/analysis_official" in s:  # analysis_official2 etc.
+                    return 2
+                return 3
+            all_stores.sort(key=_rank)
+            h5_store = all_stores[0] if all_stores else None
+
+            nbr_dir = h5_store.parent.parent if h5_store else vdb_dir
+            has_pkls = bool(list(vdb_dir.rglob("*.pkl")))
             models.append({
                 'uuid': uuid_dir.name,
                 'model_num': model_num,
-                'lancedb': vdb,
+                'lancedb': lancedb,
                 'nbr_dir': nbr_dir,
                 'h5_store': h5_store,
                 'has_pkls': has_pkls,
             })
     return models
+
+
+def _walk_json(obj, found):
+    """Recursively collect any config parameters (by canonical name or alias)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(v, (dict, list)):
+                canon = _ALIAS_TO_CANON.get(k)
+                if canon:
+                    found.setdefault(canon, v)
+            _walk_json(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json(v, found)
+
+
+def read_config(model):
+    """Locate the FLARE config files for a run and extract key parameters + sites.
+
+    Returns a dict of {param: value} plus a 'sites'/'model_name' entry. Reads every
+    JSON under workspace/*/config and merges the values we care about; sites are
+    taken from the client sub-directories under workspace/.
+    """
+    run_dir = RESULTS_DIR / model['uuid']
+    workspace = run_dir / "workspace"
+    cfg = {}
+    if workspace.exists():
+        seen_files = []
+        for pat in ("config_fed_*.json", "*config*.json", "train_config.json",
+                    "meta.json"):
+            for jf in sorted(workspace.rglob(pat)):
+                if jf not in seen_files:
+                    seen_files.append(jf)
+        for jf in seen_files:
+            try:
+                _walk_json(json.load(open(jf)), cfg)
+            except (json.JSONDecodeError, OSError):
+                continue
+    # sites: client folders alongside app_server (exclude server/admin dirs)
+    sites = []
+    if workspace.exists():
+        for d in sorted(workspace.iterdir()):
+            if d.is_dir() and d.name in SITE_LETTER:
+                sites.append(d.name)
+    if not sites:  # fall back to parsing the log
+        log = workspace / "log.txt"
+        if log.exists():
+            seen = set()
+            for line in open(log, encoding="utf-8", errors="replace"):
+                m = re.search(r"from client\s+(\S+)", line)
+                if m and m.group(1) in SITE_LETTER:
+                    seen.add(m.group(1))
+            sites = sorted(seen)
+    cfg['sites'] = ", ".join(sites) if sites else "?"
+    cfg['model_name'] = "Model " + "".join(SITE_LETTER[s] for s in sites) if sites else \
+                        f"model_{model['model_num']}"
+    return cfg
+
+
+def print_all_configs(models):
+    """Print each model's configuration separately and write config_all_models.csv."""
+    print("\n" + "=" * 70)
+    print("PER-MODEL FEDERATED-TRAINING CONFIGURATION")
+    print("(A=CCO-Abragam, B=DSV, C=nse, D=utu)")
+    print("=" * 70)
+    rows = []
+    for m in models:
+        cfg = read_config(m)
+        print(f"\n--- {cfg['model_name']}  (model_{m['model_num']}, {m['uuid'][:12]}...) ---")
+        print(f"  {'sites':<22}: {cfg['sites']}")
+        for k in CONFIG_KEYS:
+            if k in cfg:
+                print(f"  {k:<22}: {cfg[k]}")
+        row = {'model_name': cfg['model_name'], 'model_num': m['model_num'],
+               'sites': cfg['sites']}
+        row.update({k: cfg.get(k, '') for k in CONFIG_KEYS})
+        rows.append(row)
+    out = SCRIPT_DIR / "config_all_models.csv"
+    with open(out, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=['model_name', 'model_num', 'sites'] + CONFIG_KEYS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nwrote {out}")
 
 
 def build_h5_store(model):
@@ -98,12 +234,14 @@ def build_h5_store(model):
 def run_compare(model):
     """Run compare_all.py on one model and capture the output."""
     script = SCRIPT_DIR / "compare_all.py"
+    csv_out = SCRIPT_DIR / f"metrics_model_{model['model_num']}.csv"
     cmd = [
         sys.executable, str(script),
         str(model['lancedb']),
         "--store", str(model['h5_store']),
         "--splits-file", str(SPLITS_FILE),
         "--stop_list", str(STOP_LIST),
+        "--csv-out", str(csv_out),
     ]
     print(f"\n{'='*70}")
     print(f"Running compare_all.py on model_{model['model_num']}")
@@ -152,6 +290,8 @@ def main():
                     help='Build .h5 neighbour stores where missing (Step 1)')
     ap.add_argument('--models', nargs='+', default=None,
                     help='Only run these model numbers (e.g. --models 8 10 19 99)')
+    ap.add_argument('--config-only', action='store_true',
+                    help='Only print each model configuration, then exit')
     args = ap.parse_args()
 
     print("Scanning for models...")
@@ -168,6 +308,11 @@ def main():
     for m in models:
         status = "READY" if m['h5_store'] else ("can build .h5" if m['has_pkls'] else "needs .pkl files")
         print(f"  model_{m['model_num']} ({m['uuid'][:12]}...): {status}")
+
+    # Print each model's configuration separately (+ config_all_models.csv)
+    print_all_configs(models)
+    if args.config_only:
+        return
 
     # Build missing .h5 stores if requested
     if args.build_stores:
