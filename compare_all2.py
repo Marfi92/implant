@@ -1,4 +1,11 @@
-"""Compare all implant-word scoring methods on ONE shared vocabulary / splits.
+"""Compare all implant-word scoring methods, with the label-randomisation control.
+
+Identical to compare_all.py, plus --randomise-labels: every implant term is
+replaced by a random word from the same query vocabulary, so all metrics must
+collapse to chance (roc_auc ~0.5). Kept as a separate script so compare_all.py
+stays exactly as it was for the reported results.
+
+Compare all implant-word scoring methods on ONE shared vocabulary / splits.
 
 Runs every method on the SAME query-word universe (recovered from the neighbour
 store) and the SAME 100 splits, so the numbers are directly comparable:
@@ -41,6 +48,13 @@ def load_lancedb_vectors(path, table):
     vec = tbl['vector'].combine_chunks()
     flat = np.asarray(vec.values, dtype=np.float32)
     mat = flat.reshape(len(words), -1)
+    # some checkpoint exports contain non-finite (inf/-inf) cells; a single bad
+    # reference-implant vector otherwise poisons max/mean similarity for every
+    # word. Replace non-finite values with 0 so scoring stays well-defined.
+    n_bad = int((~np.isfinite(mat)).sum())
+    if n_bad:
+        print(f"  WARNING: {n_bad} non-finite cells in vectors -> set to 0")
+        mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
     return words, mat
 
 
@@ -57,11 +71,64 @@ def precision_at_k(y_sorted, k):
     return float(y_sorted[:k].sum()) / k
 
 
+def recall_at_k(y_sorted, k):
+    """Recall@k = sensitivity@k = fraction of all positives found in the top k."""
+    k = min(k, len(y_sorted))
+    total_pos = float(y_sorted.sum())
+    if total_pos == 0:
+        return 0.0
+    return float(y_sorted[:k].sum()) / total_pos
+
+
+def specificity_at_k(y_sorted, k):
+    """Specificity@k = fraction of all negatives correctly left out of the top k."""
+    k = min(k, len(y_sorted))
+    total_neg = float((y_sorted == 0).sum())
+    if total_neg == 0:
+        return 0.0
+    tp = float(y_sorted[:k].sum())
+    fp = k - tp                       # negatives wrongly ranked in top k
+    tn = total_neg - fp
+    return tn / total_neg
+
+
+def f1_at_k(y_sorted, k):
+    p = precision_at_k(y_sorted, k)
+    r = recall_at_k(y_sorted, k)
+    if p + r == 0:
+        return 0.0
+    return 2 * p * r / (p + r)
+
+
 def load_set(path):
     if not path:
         return set()
     with open(path, encoding='utf-8') as f:
         return {ln.split()[0] for ln in f if ln.strip()}
+
+
+def randomise_labels(split_items, qwords, implant_all, stop, rng):
+    """Replace each implant term by a random word from the query vocabulary.
+
+    The mapping is drawn once and reused in every split, so all set sizes and
+    the ref/dev/test structure are preserved; only the identity of the
+    "implants" is destroyed. Words already known to be implants and stop words
+    are excluded from the pool, so a fake positive can never be a real implant.
+    """
+    pool = [w for w in dict.fromkeys(qwords) if w not in implant_all and w not in stop]
+    terms = sorted(implant_all)
+    picked = rng.choice(len(pool), size=len(terms), replace=False)
+    mapping = dict(zip(terms, [pool[i] for i in picked]))
+    print(f"LABEL RANDOMISATION: {len(mapping)} implant terms replaced by "
+          f"random words from a pool of {len(pool)}")
+    print(f"  example: {list(mapping.items())[:3]}")
+
+    def remap(value):
+        if isinstance(value, list):
+            return [mapping[w] for w in value if w in mapping]
+        return value
+
+    return [(sid, {k: remap(v) for k, v in sp.items()}) for sid, sp in split_items]
 
 
 def main():
@@ -74,18 +141,40 @@ def main():
     ap.add_argument('--ks', default='50,100,200')
     ap.add_argument('--neg-ratio-train', type=int, default=10,
                     help='negatives per positive used to TRAIN the classifier')
+    ap.add_argument('--use-all-neg', action='store_true',
+                    help='train on ALL pool negatives (no subsampling); makes '
+                         'pu_rn identical to pu_lr')
+    ap.add_argument('--no-class-weight', action='store_true',
+                    help='do NOT use class_weight=balanced (use natural imbalance)')
+    ap.add_argument('--eval-full-pool', action='store_true',
+                    help='evaluate on the FULL negative pool (include words used '
+                         'as training negatives) to match the standalone runs')
     ap.add_argument('--no-lexical', action='store_true',
                     help='skip the lexical (string-similarity) feature/method')
+    ap.add_argument('--dump-weights', default=None,
+                    help='write the learned per-feature logistic-regression '
+                         'weights (mean/std over splits) for pu_lr and pu_rn '
+                         'to this CSV, and print them')
     ap.add_argument('--lex-chunk', type=int, default=20000,
                     help='row chunk size for the lexical similarity computation')
     ap.add_argument('--no-full-sim', action='store_true',
                     help='skip the full-embedding "distance to ALL implants" methods')
     ap.add_argument('--topk-all', type=int, default=10,
                     help='k for votetopk_all (sum of top-k implant similarities)')
+    ap.add_argument('--randomise-labels', action='store_true',
+                    help='CONTROL: replace every implant term by a random word '
+                         'from the same query vocabulary (same replacement in '
+                         'all splits, so set sizes and the ref/dev/test '
+                         'structure are preserved). All metrics must collapse '
+                         'to chance (roc_auc ~0.5); anything higher indicates '
+                         'leakage in the pipeline')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--csv-out', default=None,
+                    help='write full metric table (mean and std per method) to this CSV')
     args = ap.parse_args()
     use_lexical = not args.no_lexical
     use_full = not args.no_full_sim
+    class_weight = None if args.no_class_weight else 'balanced'
 
     ks = [int(x) for x in args.ks.split(',')]
     rng = np.random.default_rng(args.seed)
@@ -120,6 +209,11 @@ def main():
     stop = load_set(args.stop_list)
     first = split_items[0][1]
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
+
+    if args.randomise_labels:
+        split_items = randomise_labels(split_items, qwords, implant_all, stop, rng)
+        first = split_items[0][1]
+        implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
 
     qword_to_qidx = {w: i for i, w in enumerate(qwords)}
     is_implant = np.array([w in implant_all for w in qwords], dtype=bool)
@@ -162,8 +256,18 @@ def main():
     if use_lexical:
         methods.append('lexical')
     methods += ['hybrid', 'pu_lr', 'pu_rn']
-    metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
+    metric_names = ['roc_auc', 'average_precision']
+    for k in ks:
+        metric_names += [f'precision_at_{k}', f'recall_at_{k}',
+                         f'sensitivity_at_{k}', f'specificity_at_{k}', f'f1_at_{k}']
     results = {m: {mn: [] for mn in metric_names} for m in methods}
+
+    feat_names = ['vote', 'mindist', 'avgdist', 'centroid', 'cnt']
+    if use_full:
+        feat_names += ['mindist_all', 'avgdist_all', 'votetopk_all']
+    if use_lexical:
+        feat_names.append('lexical')
+    weight_log = {'pu_lr': [], 'pu_rn': []}
 
     for sid, sp in split_items:
         ref, test = sp['ref'], sp['test']
@@ -217,14 +321,18 @@ def main():
             feat_cols += [mindist_all, avgdist_all, votetopk_all]
         if use_lexical:
             feat_cols.append(lex)
-        feats = np.column_stack(feat_cols)
+        feats = np.nan_to_num(np.column_stack(feat_cols), nan=0.0)
 
         pos_train = np.array([i for i in ref_idx], dtype=int)
         neg_pool_idx = np.flatnonzero(neg_pool)
 
-        # --- pu_lr: random unlabeled words as "negatives"
-        n_train_neg = min(len(neg_pool_idx), args.neg_ratio_train * len(pos_train))
-        train_neg = rng.choice(neg_pool_idx, size=n_train_neg, replace=False)
+        # --- pu_lr: unlabeled words as "negatives"
+        if args.use_all_neg:
+            n_train_neg = len(neg_pool_idx)
+            train_neg = neg_pool_idx
+        else:
+            n_train_neg = min(len(neg_pool_idx), args.neg_ratio_train * len(pos_train))
+            train_neg = rng.choice(neg_pool_idx, size=n_train_neg, replace=False)
 
         # --- pu_rn: RELIABLE negatives = unlabeled words LEAST similar to implants
         #     (lowest centroid similarity) -> cleaner negative set ("two-step" PU)
@@ -236,26 +344,33 @@ def main():
             Xtr = np.vstack([feats[pos_train], feats[neg_idx]])
             ytr = np.concatenate([np.ones(len(pos_train)), np.zeros(len(neg_idx))])
             sc = StandardScaler().fit(Xtr)
-            c = LogisticRegression(max_iter=1000, class_weight='balanced')
-            c.fit(sc.transform(Xtr), ytr)
+            Xtr_s = np.nan_to_num(sc.transform(Xtr), nan=0.0)
+            c = LogisticRegression(max_iter=1000, class_weight=class_weight)
+            c.fit(Xtr_s, ytr)
             return sc, c
 
         sc_lr, clf_lr = fit_clf(train_neg)
         sc_rn, clf_rn = fit_clf(rn_neg)
+        weight_log['pu_lr'].append(clf_lr.coef_.ravel())
+        weight_log['pu_rn'].append(clf_rn.coef_.ravel())
 
-        # evaluation universe: test positives + negatives NOT used for training
-        # (exclude any word used as a training negative by EITHER classifier)
-        used_neg = set(train_neg.tolist()) | set(rn_neg.tolist())
-        eval_neg = np.array([i for i in neg_pool_idx if i not in used_neg], dtype=int)
+        # evaluation universe: test positives + negatives.
+        # By default exclude any word used as a training negative by EITHER
+        # classifier; --eval-full-pool keeps the full pool (matches standalone runs).
+        if args.eval_full_pool:
+            eval_neg = neg_pool_idx
+        else:
+            used_neg = set(train_neg.tolist()) | set(rn_neg.tolist())
+            eval_neg = np.array([i for i in neg_pool_idx if i not in used_neg], dtype=int)
         eval_idx = np.concatenate([np.flatnonzero(test_pos), eval_neg])
         y = np.concatenate([np.ones(int(test_pos.sum())), np.zeros(len(eval_neg))]).astype(int)
 
         def z(a):
             m, s = a.mean(), a.std()
             return (a - m) / (s if s > 0 else 1.0)
-        hybrid_all = z(vote) + z(csim) + (z(lex) if use_lexical else 0.0)
-        pu_lr_all = clf_lr.predict_proba(sc_lr.transform(feats))[:, 1]
-        pu_rn_all = clf_rn.predict_proba(sc_rn.transform(feats))[:, 1]
+        hybrid_all = np.nan_to_num(z(vote) + z(csim) + (z(lex) if use_lexical else 0.0), nan=0.0)
+        pu_lr_all = clf_lr.predict_proba(np.nan_to_num(sc_lr.transform(feats), nan=0.0))[:, 1]
+        pu_rn_all = clf_rn.predict_proba(np.nan_to_num(sc_rn.transform(feats), nan=0.0))[:, 1]
 
         score_map = {
             'vote': vote, 'mindist': mindist, 'avgdist': avgdist,
@@ -269,13 +384,20 @@ def main():
         if use_lexical:
             score_map['lexical'] = lex
         for m in methods:
-            s = score_map[m][eval_idx]
-            order = np.argsort(-s, kind='stable')
+            s = np.nan_to_num(score_map[m][eval_idx], nan=0.0)
+            # random permutation before ranking so tied/constant scores break
+            # ties uniformly at random instead of following the vocabulary order
+            perm = rng.permutation(len(s))
+            order = perm[np.argsort(-s[perm], kind='stable')]
             y_sorted = y[order]
             results[m]['roc_auc'].append(roc_auc_score(y, s))
             results[m]['average_precision'].append(average_precision_score(y, s))
             for k in ks:
                 results[m][f'precision_at_{k}'].append(precision_at_k(y_sorted, k))
+                results[m][f'recall_at_{k}'].append(recall_at_k(y_sorted, k))
+                results[m][f'sensitivity_at_{k}'].append(recall_at_k(y_sorted, k))
+                results[m][f'specificity_at_{k}'].append(specificity_at_k(y_sorted, k))
+                results[m][f'f1_at_{k}'].append(f1_at_k(y_sorted, k))
 
     # ---- aggregate + print
     print("\n" + "=" * 78)
@@ -293,6 +415,52 @@ def main():
     print("=" * 78)
     n_used = len(results['vote']['roc_auc'])
     print(f"splits used: {n_used}")
+
+    if args.csv_out:
+        import csv as _csv
+        with open(args.csv_out, 'w', newline='') as f:
+            w = _csv.writer(f)
+            header = ['method']
+            for mn in metric_names:
+                header += [f'{mn}_mean', f'{mn}_std']
+            w.writerow(header)
+            for m in methods:
+                row = [m]
+                for mn in metric_names:
+                    vals = results[m][mn]
+                    row += [f'{np.mean(vals):.4f}', f'{np.std(vals):.4f}']
+                w.writerow(row)
+        print(f"wrote {args.csv_out}")
+
+    # ---- learned per-feature weights (logistic-regression coefficients)
+    if not weight_log['pu_lr']:
+        return
+    print("\n" + "=" * 78)
+    print("LEARNED FEATURE WEIGHTS (standardized coefficients, mean±std over splits)")
+    print("higher |weight| = feature matters more; sign shows direction")
+    print("=" * 78)
+    print(f"{'feature':<16}{'pu_lr':>22}{'pu_rn':>22}")
+    print("-" * 60)
+    wmeans = {clf: np.mean(np.vstack(w), axis=0) for clf, w in weight_log.items()}
+    wstds = {clf: np.std(np.vstack(w), axis=0) for clf, w in weight_log.items()}
+    for i, fn in enumerate(feat_names):
+        print(f"{fn:<16}"
+              f"{wmeans['pu_lr'][i]:>13.4f}±{wstds['pu_lr'][i]:<7.4f}"
+              f"{wmeans['pu_rn'][i]:>13.4f}±{wstds['pu_rn'][i]:<7.4f}")
+    print("=" * 78)
+
+    if args.dump_weights:
+        import csv as _csv
+        with open(args.dump_weights, 'w', newline='') as f:
+            w = _csv.writer(f)
+            w.writerow(['feature',
+                        'pu_lr_weight_mean', 'pu_lr_weight_std',
+                        'pu_rn_weight_mean', 'pu_rn_weight_std'])
+            for i, fn in enumerate(feat_names):
+                w.writerow([fn,
+                            f'{wmeans["pu_lr"][i]:.4f}', f'{wstds["pu_lr"][i]:.4f}',
+                            f'{wmeans["pu_rn"][i]:.4f}', f'{wstds["pu_rn"][i]:.4f}'])
+        print(f"wrote {args.dump_weights}")
 
 
 if __name__ == '__main__':
