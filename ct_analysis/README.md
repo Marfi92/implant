@@ -75,7 +75,7 @@ python 03_convert_nifti_one_by_one.py --type all --delete-after --resume
 
 ### 4. `04_build_site_dicom_inventories.py` — All-site scalable DICOM inventory
 
-Recursively scans every file below the extracted datahub, reads DICOM headers without loading pixel data, and safely resumes by skipping unchanged files. Folder names such as `ct_site_4_ccta_24` are parsed into site, protocol, and archive batch.
+Recursively scans every file below the extracted datahub, reads DICOM headers without loading pixel data, and safely resumes by skipping unchanged files. Folder names such as `ct_site_4_ccta_24` are parsed into site, protocol, and archive batch; names that deviate (`site-5-casc`, `ct_site_5_ccta_24b`) fall back to a `site<number>` search so no site is silently dropped.
 
 The raw inventory is stored in SQLite because a complete per-file/all-tag inventory can exceed Excel's 1,048,576-row limit. Excel workbooks contain the analysis-ready patient, study, series, acquisition, reconstruction, protocol, and 3D/4D summaries with clickable source-folder links.
 
@@ -94,6 +94,13 @@ Each site workbook contains:
 - `3D_4D_Images` with folder and example-file hyperlinks
 - `Protocols` for protocol comparison
 - `Quality_Summary` and `Read_Errors`
+
+A site only gets a workbook when DICOM headers were actually read for it. `SCAPIS_all_sites_3D_4D_inventory.xlsx` therefore has a `Folder_Coverage` sheet listing every top-level source folder with file counts and a status:
+- `dicom_found` — headers were read, so the site has a workbook.
+- `only_archives_extract_first` — the folder still holds `.7z`/`.zip` archives, so extract them (or point `--root` at the extracted copy) and re-run.
+- `no_dicom_headers` / `empty_folder` — files exist but none are DICOM, or the folder is empty.
+
+The same list is printed at the end of the run, one workbook failure no longer stops the remaining sites, and control characters in DICOM text are stripped before writing Excel.
 
 **Recommended Windows run:**
 ```bat
@@ -130,9 +137,24 @@ The 4D classification is intentionally conservative:
 
 ---
 
+### 5. `05_check_site_coverage.py` — Why is a site missing?
+
+Fast per-folder check that answers "why is there no Excel for site 5 or site 6?" without re-scanning every DICOM. It counts files, archives, and sampled DICOM headers per top-level folder, compares them with the SQLite database and the workbooks already in the output folder, and writes `site_coverage_check.xlsx`.
+
+```bat
+python 05_check_site_coverage.py ^
+  --root "Q:\users\leejo\data\scapis\datahub" ^
+  --output "Q:\users\marfi\CT_analysis"
+
+REM Test every file instead of 25 per folder
+python 05_check_site_coverage.py --sample 0
+```
+
+---
+
 ## Workflow
 
-1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index.
+1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
 2. Use Script 2 for plots when needed (it consumes the legacy Script 1 series workbook).
 3. Use Script 3 only when selected DICOM series need NIfTI conversion.
 4. Scripts 1–3 remain available for the earlier `V:\datahub` workflow.

@@ -36,10 +36,14 @@ from pydicom.multival import MultiValue
 from pydicom.sequence import Sequence as DicomSequence
 
 SITE_FOLDER_RE = re.compile(
-    r"^ct[_-]site[_-](?P<site>\d+)[_-](?P<protocol>casc|ccta)"
-    r"(?:[_-](?P<batch>\d+))?$",
+    r"^ct[_-]?site[_-]?(?P<site>\d+)[_-](?P<protocol>casc|ccta)"
+    r"(?:[_-](?P<batch>[0-9a-z]+))?$",
     re.IGNORECASE,
 )
+SITE_HINT_RE = re.compile(r"site[_-]?(?P<site>\d+)", re.IGNORECASE)
+PROTOCOL_HINT_RE = re.compile(r"(?P<protocol>casc|ccta)", re.IGNORECASE)
+BATCH_HINT_RE = re.compile(r"(?P<batch>\d+)$")
+ARCHIVE_SUFFIXES = {".7z", ".zip", ".rar", ".gz", ".tar", ".tgz", ".bz2", ".xz"}
 PHASE_PERCENT_RE = re.compile(r"(?<!\d)(?P<phase>\d{1,3})\s*%")
 SCAN_OPTION_PHASE_RE = re.compile(
     r"(?:TP|BESTPH_D_P)0*(?P<phase>\d{2,3})PC", re.IGNORECASE
@@ -47,6 +51,7 @@ SCAN_OPTION_PHASE_RE = re.compile(
 SCAN_OPTION_HEART_RATE_RE = re.compile(
     r"OSCRATEAVG0*(?P<rate>\d{2,3})BPM", re.IGNORECASE
 )
+EXCEL_ILLEGAL_RE = re.compile(r"[\000-\010\013\014\016-\037]")
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_DATA_ROWS = EXCEL_MAX_ROWS - 1
 
@@ -368,7 +373,44 @@ def source_info(path: Path, root: Path) -> SourceInfo:
                 protocol=match.group("protocol").upper(),
                 archive_batch=match.group("batch") or "",
             )
+    return hinted_source_info(parts)
+
+
+def hinted_source_info(parts: Sequence[str]) -> SourceInfo:
+    """Recover site and protocol from folder names that miss the strict layout."""
+    for part in reversed(parts):
+        hint = SITE_HINT_RE.search(part)
+        if hint is None:
+            continue
+
+        protocol_match = PROTOCOL_HINT_RE.search(part)
+        if protocol_match is None:
+            for other in reversed(parts):
+                protocol_match = PROTOCOL_HINT_RE.search(other)
+                if protocol_match is not None:
+                    break
+
+        batch_match = BATCH_HINT_RE.search(part)
+        batch = (
+            batch_match.group("batch")
+            if batch_match and batch_match.start() >= hint.end()
+            else ""
+        )
+        return SourceInfo(
+            source_folder=part,
+            site_number=hint.group("site"),
+            protocol=(
+                protocol_match.group("protocol").upper()
+                if protocol_match
+                else "unknown"
+            ),
+            archive_batch=batch,
+        )
     return SourceInfo("unclassified", "unknown", "unknown", "")
+
+
+def is_site_folder_name(name: str) -> bool:
+    return bool(SITE_FOLDER_RE.match(name) or SITE_HINT_RE.search(name))
 
 
 def iter_files(root: Path, output: Path, limit: int = 0) -> Iterator[Path]:
@@ -561,6 +603,21 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
         """
     )
     connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS folder_coverage (
+            folder TEXT PRIMARY KEY,
+            site_number TEXT,
+            files INTEGER,
+            dicom_files INTEGER,
+            unchanged_files INTEGER,
+            non_dicom_files INTEGER,
+            read_errors INTEGER,
+            archive_files INTEGER,
+            status TEXT
+        )
+        """
+    )
+    connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_dicom_series ON dicom_files(series_key)"
     )
     connection.execute(
@@ -616,6 +673,88 @@ def insert_error(connection: sqlite3.Connection, result: ScanResult) -> None:
     )
 
 
+def top_level_folder(path: Path, root: Path) -> str:
+    display = Path(display_path(path))
+    display_root = Path(display_path(root))
+    try:
+        parts = display.relative_to(display_root).parts
+    except ValueError:
+        return "<outside root>"
+    return parts[0] if len(parts) > 1 else "<root>"
+
+
+def new_coverage_row() -> dict[str, int]:
+    return {
+        "files": 0,
+        "dicom": 0,
+        "unchanged": 0,
+        "not_dicom": 0,
+        "error": 0,
+        "archive": 0,
+    }
+
+
+def coverage_status(row: dict[str, int]) -> str:
+    if row["dicom"] or row["unchanged"]:
+        return "dicom_found"
+    if row["archive"]:
+        return "only_archives_extract_first"
+    if row["files"]:
+        return "no_dicom_headers"
+    return "empty_folder"
+
+
+def save_folder_coverage(
+    connection: sqlite3.Connection, coverage: dict[str, dict[str, int]]
+) -> None:
+    connection.executemany(
+        """
+        INSERT OR REPLACE INTO folder_coverage
+        (folder, site_number, files, dicom_files, unchanged_files,
+         non_dicom_files, read_errors, archive_files, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                folder,
+                hinted_source_info([folder]).site_number,
+                row["files"],
+                row["dicom"],
+                row["unchanged"],
+                row["not_dicom"],
+                row["error"],
+                row["archive"],
+                coverage_status(row),
+            )
+            for folder, row in sorted(coverage.items())
+        ],
+    )
+    connection.commit()
+
+
+def report_missing_folders(coverage: dict[str, dict[str, int]]) -> None:
+    incomplete = {
+        folder: row
+        for folder, row in sorted(coverage.items())
+        if coverage_status(row) != "dicom_found"
+    }
+    if not incomplete:
+        return
+    print(
+        "\nWARNING: these folders produced no DICOM headers, so they get no workbook:"
+    )
+    for folder, row in incomplete.items():
+        print(
+            f"  {folder}: {row['files']:,} files, "
+            f"{row['archive']:,} archives, status={coverage_status(row)}"
+        )
+    if any(row["archive"] for row in incomplete.values()):
+        print(
+            "  Folders marked only_archives_extract_first still hold .7z/.zip archives."
+        )
+        print("  Extract them (or point --root at the extracted copy) and re-run.")
+
+
 def scan_root(
     root: Path,
     output: Path,
@@ -626,13 +765,16 @@ def scan_root(
     limit: int,
 ) -> None:
     counts = {"filesystem": 0, "dicom": 0, "not_dicom": 0, "error": 0, "unchanged": 0}
-    pending: set[Future[ScanResult]] = set()
+    coverage: dict[str, dict[str, int]] = {}
+    pending: dict[Future[ScanResult], str] = {}
     records: list[dict[str, object]] = []
     started = time.time()
 
     def consume(future: Future[ScanResult]) -> None:
+        folder = pending.pop(future)
         result = future.result()
         counts[result.kind] += 1
+        coverage[folder][result.kind] += 1
         if result.kind == "dicom" and result.record is not None:
             records.append(result.record)
         elif result.kind == "error":
@@ -641,15 +783,19 @@ def scan_root(
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         for path in iter_files(root, output, limit):
             counts["filesystem"] += 1
+            folder = top_level_folder(path, root)
+            row = coverage.setdefault(folder, new_coverage_row())
+            row["files"] += 1
+            if path.suffix.lower() in ARCHIVE_SUFFIXES:
+                row["archive"] += 1
             if is_unchanged(connection, path):
                 counts["unchanged"] += 1
+                row["unchanged"] += 1
                 continue
-            pending.add(executor.submit(scan_file, path, root, keep_all_tags))
+            pending[executor.submit(scan_file, path, root, keep_all_tags)] = folder
 
             if len(pending) >= max(workers * 8, batch_size):
-                done = next(as_completed(pending))
-                pending.remove(done)
-                consume(done)
+                consume(next(as_completed(pending)))
 
             if len(records) >= batch_size:
                 insert_records(connection, records)
@@ -666,7 +812,7 @@ def scan_root(
                     f"{counts['filesystem'] / elapsed:.1f} files/s"
                 )
 
-        for future in as_completed(pending):
+        for future in list(as_completed(pending)):
             consume(future)
             if len(records) >= batch_size:
                 insert_records(connection, records)
@@ -675,6 +821,7 @@ def scan_root(
 
     insert_records(connection, records)
     connection.commit()
+    save_folder_coverage(connection, coverage)
     elapsed = time.time() - started
     print("\nScan complete")
     print(f"  Files encountered: {counts['filesystem']:,}")
@@ -683,6 +830,7 @@ def scan_root(
     print(f"  Non-DICOM files:   {counts['not_dicom']:,}")
     print(f"  Read errors:       {counts['error']:,}")
     print(f"  Elapsed:           {elapsed / 60:.1f} minutes")
+    report_missing_folders(coverage)
 
 
 def numeric(value: object, default: float = 0.0) -> float:
@@ -1055,7 +1203,7 @@ def common_source_parent(values: Iterable[object]) -> str:
         return ""
     source_folder = Path(paths[0])
     for parent in [source_folder, *source_folder.parents]:
-        if parent.name and SITE_FOLDER_RE.match(parent.name):
+        if parent.name and is_site_folder_name(parent.name):
             return str(parent)
     return str(source_folder)
 
@@ -1183,6 +1331,28 @@ def windows_file_uri(value: object) -> str:
         return text
 
 
+def sanitize_for_excel(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Strip control characters that openpyxl refuses to write."""
+    if dataframe.empty:
+        return dataframe
+    cleaned = dataframe.copy()
+    for column in cleaned.columns[cleaned.dtypes == object]:
+        cleaned[column] = cleaned[column].map(
+            lambda value: (
+                EXCEL_ILLEGAL_RE.sub("", value) if isinstance(value, str) else value
+            )
+        )
+    return cleaned
+
+
+def write_sheet(
+    writer: pd.ExcelWriter, dataframe: pd.DataFrame, sheet_name: str
+) -> None:
+    sanitize_for_excel(dataframe).to_excel(
+        writer, sheet_name=sheet_name[:31], index=False
+    )
+
+
 def write_dataframe_chunks(
     writer: pd.ExcelWriter,
     dataframe: pd.DataFrame,
@@ -1191,6 +1361,7 @@ def write_dataframe_chunks(
     if dataframe.empty:
         dataframe.to_excel(writer, sheet_name=base_sheet_name[:31], index=False)
         return [base_sheet_name[:31]]
+    dataframe = sanitize_for_excel(dataframe)
     sheets: list[str] = []
     for index, start in enumerate(range(0, len(dataframe), EXCEL_DATA_ROWS), 1):
         suffix = f"_{index}" if len(dataframe) > EXCEL_DATA_ROWS else ""
@@ -1264,6 +1435,12 @@ def file_inventory(connection: sqlite3.Connection, site_number: str) -> pd.DataF
     )
 
 
+def folder_coverage(connection: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT * FROM folder_coverage ORDER BY site_number, folder", connection
+    )
+
+
 def workbook_guide(database_path: Path) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -1286,6 +1463,10 @@ def workbook_guide(database_path: Path) -> pd.DataFrame:
             {
                 "output": "SQLite database",
                 "contents": f"{database_path} contains one row per DICOM file and all non-pixel header tags as JSON.",
+            },
+            {
+                "output": "Folder_Coverage",
+                "contents": "Every top-level source folder with file counts and whether DICOM headers were found; folders that still hold .7z/.zip archives are flagged only_archives_extract_first.",
             },
             {
                 "output": "4D rule",
@@ -1318,12 +1499,12 @@ def create_site_workbook(
     errors = read_errors(connection, site)
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
-        workbook_guide(database_path).to_excel(writer, sheet_name="Guide", index=False)
-        overview.to_excel(writer, sheet_name="Overview", index=False)
-        folders.to_excel(writer, sheet_name="Source_Folders", index=False)
-        protocols.to_excel(writer, sheet_name="Protocols", index=False)
-        patients.to_excel(writer, sheet_name="Patients", index=False)
-        studies.to_excel(writer, sheet_name="Studies", index=False)
+        write_sheet(writer, workbook_guide(database_path), "Guide")
+        write_sheet(writer, overview, "Overview")
+        write_sheet(writer, folders, "Source_Folders")
+        write_sheet(writer, protocols, "Protocols")
+        write_sheet(writer, patients, "Patients")
+        write_sheet(writer, studies, "Studies")
         write_dataframe_chunks(writer, site_series, "Series")
         write_dataframe_chunks(
             writer,
@@ -1336,7 +1517,7 @@ def create_site_workbook(
             "CCTA_Series",
         )
         write_dataframe_chunks(writer, images, "3D_4D_Images")
-        quality.to_excel(writer, sheet_name="Quality_Summary", index=False)
+        write_sheet(writer, quality, "Quality_Summary")
         write_dataframe_chunks(writer, errors, "Read_Errors")
         if include_file_sheets:
             write_dataframe_chunks(
@@ -1367,12 +1548,13 @@ def create_master_workbook(
     errors = read_errors(connection)
 
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
-        workbook_guide(database_path).to_excel(writer, sheet_name="Guide", index=False)
-        site_summary.to_excel(writer, sheet_name="Site_Summary", index=False)
+        write_sheet(writer, workbook_guide(database_path), "Guide")
+        write_sheet(writer, site_summary, "Site_Summary")
+        write_sheet(writer, folder_coverage(connection), "Folder_Coverage")
         write_dataframe_chunks(writer, images, "All_3D_4D")
-        protocols.to_excel(writer, sheet_name="Protocol_Matrix", index=False)
-        folder_index.to_excel(writer, sheet_name="Folder_Index", index=False)
-        quality.to_excel(writer, sheet_name="Quality_Summary", index=False)
+        write_sheet(writer, protocols, "Protocol_Matrix")
+        write_sheet(writer, folder_index, "Folder_Index")
+        write_sheet(writer, quality, "Quality_Summary")
         write_dataframe_chunks(writer, errors, "Read_Errors")
 
     format_workbook(
@@ -1400,25 +1582,58 @@ def build_reports(
     sites = sorted(
         series["site_number"].fillna("unknown").astype(str).unique(), key=site_sort_key
     )
+    print(f"Sites found in the database: {', '.join(sites)}")
+    failures: list[str] = []
     for site in sites:
         site_series = series[
             series["site_number"].fillna("unknown").astype(str) == site
         ].copy()
         print(f"Writing site {site} workbook ({len(site_series):,} series)...")
-        outputs.append(
-            create_site_workbook(
-                site,
-                site_series,
-                connection,
-                output,
-                database_path,
-                include_file_sheets,
+        try:
+            outputs.append(
+                create_site_workbook(
+                    site,
+                    site_series,
+                    connection,
+                    output,
+                    database_path,
+                    include_file_sheets,
+                )
             )
-        )
+        except Exception as error:
+            failures.append(f"site {site}: {error}")
+            print(f"  ERROR: site {site} workbook failed: {error}", file=sys.stderr)
 
     print("Writing all-sites 3D/4D workbook...")
-    outputs.append(create_master_workbook(series, connection, output, database_path))
+    try:
+        outputs.append(
+            create_master_workbook(series, connection, output, database_path)
+        )
+    except Exception as error:
+        failures.append(f"all-sites workbook: {error}")
+        print(f"  ERROR: all-sites workbook failed: {error}", file=sys.stderr)
+
+    missing = missing_site_report(connection, sites)
+    if not missing.empty:
+        print("\nFolders scanned but absent from the workbooks:")
+        for _, row in missing.iterrows():
+            print(f"  {row['folder']} (status={row['status']})")
+
+    if failures:
+        print("\nWorkbooks that failed to write:")
+        for failure in failures:
+            print(f"  {failure}")
     return outputs
+
+
+def missing_site_report(
+    connection: sqlite3.Connection, written_sites: Sequence[str]
+) -> pd.DataFrame:
+    coverage = folder_coverage(connection)
+    if coverage.empty:
+        return coverage
+    written = {str(site) for site in written_sites}
+    return coverage[~coverage["site_number"].astype(str).isin(written)]
 
 
 def site_sort_key(value: str) -> tuple[int, int | str]:
