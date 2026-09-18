@@ -417,59 +417,84 @@ def pilot_set(pairs: pd.DataFrame, merged: pd.DataFrame, count: int) -> pd.DataF
     return pd.DataFrame(rows)
 
 
-def af_not_usable(
-    table: pd.DataFrame, dropped: pd.DataFrame, clinical: pd.DataFrame, kept_ids: set[str]
-) -> pd.DataFrame:
-    """One row per AF patient without a usable series, and the rule that removed it.
+STATUS_COLUMNS = [
+    "patient_id",
+    "group",
+    "usable",
+    "reason",
+    "clinical_site",
+    "sex",
+    "age",
+    "bmi",
+    "series_uid",
+    "series_description",
+    "slices",
+    "slice_thickness_mm",
+    "duplicate_sop_count",
+    "kvp",
+    "phase_percent",
+    "series_folder",
+]
 
-    The reason shown is the one from that patient's closest-to-passing series (the
-    contrast CCTA row with the most slice positions), so relaxing that single rule
-    tells you how many AF patients you would recover.
+
+def patient_status(
+    clinical: pd.DataFrame,
+    table: pd.DataFrame,
+    dropped: pd.DataFrame,
+    selected: pd.DataFrame,
+) -> pd.DataFrame:
+    """One row per patient in the clinical CSV: usable yes/no and why not.
+
+    For a patient without a usable series the reason comes from that patient's own
+    closest-to-passing series (its CCTA rows first, then the one with the most slice
+    positions), so the reason counts say how many patients each single rule costs.
     """
-    af_ids = set(clinical.loc[clinical["af"] == "YES", "patient_id"])
-    missing = af_ids - kept_ids
-    with_series = set(table.loc[table["patient_id"].isin(missing), "patient_id"])
-    rows: list[dict[str, object]] = []
-    for patient in sorted(missing - with_series):
-        rows.append(
-            {
-                "patient_id": patient,
-                "reason": "no CT series in the inventory",
-                "series_description": "",
-                "slices": 0,
-                "duplicate_sop_count": "",
-                "slice_thickness_mm": "",
-            }
-        )
-    candidates = dropped[dropped["patient_id"].isin(with_series)]
-    preferred = candidates[
-        candidates["series_role"].astype(str).isin(["ccta", "probable_ccta"])
+    detail = [
+        "series_uid",
+        "series_description",
+        "slices",
+        "slice_thickness_mm",
+        "duplicate_sop_count",
+        "kvp",
+        "phase_percent",
+        "series_folder",
     ]
-    for patient, group in (preferred if not preferred.empty else candidates).groupby(
-        "patient_id"
-    ):
-        best = group.sort_values("slices", ascending=False).iloc[0]
-        rows.append(
-            {
-                "patient_id": str(patient),
-                "reason": best["rejected_because"],
-                "series_description": best.get("series_description", ""),
-                "slices": best["slices"],
-                "duplicate_sop_count": best.get("duplicate_sop_count", ""),
-                "slice_thickness_mm": best.get("slice_thickness_mm", ""),
-            }
-        )
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "patient_id",
-            "reason",
-            "series_description",
-            "slices",
-            "duplicate_sop_count",
-            "slice_thickness_mm",
-        ],
+    ok = selected[["patient_id", *[c for c in detail if c in selected.columns]]].copy()
+    ok["usable"] = "ok"
+    ok["reason"] = ""
+
+    closest = dropped.copy()
+    closest["is_ccta"] = (
+        closest["series_role"].astype(str).isin(["ccta", "probable_ccta"]).astype(int)
     )
+    closest = closest.sort_values(
+        ["patient_id", "is_ccta", "slices"], ascending=[True, False, False]
+    ).drop_duplicates(subset=["patient_id"], keep="first")
+    bad = closest[
+        ["patient_id", "rejected_because", *[c for c in detail if c in closest.columns]]
+    ].rename(columns={"rejected_because": "reason"})
+    bad = bad[~bad["patient_id"].isin(set(ok["patient_id"]))]
+    bad["usable"] = "not ok"
+
+    report = clinical.merge(
+        pd.concat([ok, bad], ignore_index=True), on="patient_id", how="left"
+    )
+    report["group"] = report["af"].map({"YES": "AF", "NO": "control"}).fillna("unknown")
+    seen = set(table["patient_id"])
+    report["usable"] = report["usable"].fillna("not ok")
+    report["reason"] = report["reason"].fillna("")
+    no_series = report["reason"].eq("") & report["usable"].eq("not ok")
+    report.loc[no_series, "reason"] = report.loc[no_series, "patient_id"].map(
+        lambda patient: (
+            "CT series present but no rejection recorded"
+            if patient in seen
+            else "no CT series in the inventory"
+        )
+    )
+    for column in STATUS_COLUMNS:
+        if column not in report.columns:
+            report[column] = pd.NA
+    return report[STATUS_COLUMNS].sort_values(["group", "usable", "patient_id"])
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -496,7 +521,8 @@ def main(argv: list[str] | None = None) -> None:
     pairs = match_pairs(af_table, control_table, args.age_tolerance)
     matched_controls = set(pairs.loc[pairs["matched"], "control_patient_id"])
     pilot = pilot_set(pairs, merged, args.pilot)
-    lost = af_not_usable(table, dropped, clinical, set(selected["patient_id"]))
+    status = patient_status(clinical, table, dropped, selected)
+    lost = status[(status["group"] == "AF") & (status["usable"] == "not ok")]
     reasons = (
         dropped["rejected_because"].value_counts().rename("series").reset_index()
     )
@@ -544,6 +570,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         sanitize(pairs).to_excel(writer, sheet_name="Matched_Pairs", index=False)
         sanitize(pilot).to_excel(writer, sheet_name="Pilot_nnUNet", index=False)
+        sanitize(status).to_excel(writer, sheet_name="All_Patients", index=False)
         sanitize(lost).to_excel(writer, sheet_name="AF_Not_Usable", index=False)
         sanitize(lost_reasons).to_excel(
             writer, sheet_name="AF_Loss_Reasons", index=False

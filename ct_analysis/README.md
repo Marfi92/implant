@@ -158,7 +158,7 @@ Joins the clinical CSV (`Subject`, `AF_CT_Baseline`, `Sex`, `AgeAtVisitOne`, `He
 
 Kept series must be contrast CCTA, an `ORIGINAL` reconstruction, a 3D volume, `<= 1.0 mm`, `duplicate_sop_count = 0`, with at least `--min-slices` unique slice positions matching the image count. Ties are broken towards `BestDiast` / the phase closest to `--target-phase` (default 70), the `I26f` kernel, then the thinnest recon with the most slices. Controls are matched inside exact site/sex/kVp/thickness strata, then on closest age and BMI.
 
-**Output:** `af_cohort.xlsx` with `Summary`, `AF_Selected`, `Control_Selected`, `Matched_Pairs`, `Pilot_nnUNet` (one nnU-Net case per row, with the geometry columns and the `series_folder` path), `AF_Not_Usable` (one row per AF patient with no usable series, naming the rule that removed its closest-to-passing series), `AF_Loss_Reasons`, and `Rejected` / `Rejection_Reasons` (every dropped series with `rejected_because`, plus the counts).
+**Output:** `af_cohort.xlsx` with `Summary`, `AF_Selected`, `Control_Selected`, `Matched_Pairs`, `Pilot_nnUNet` (one nnU-Net case per row, with the geometry columns and the `series_folder` path), `All_Patients` (every patient in the clinical CSV with `group` AF/control, `usable` ok/not ok and the `reason`), `AF_Not_Usable`, `AF_Loss_Reasons`, and `Rejected` / `Rejection_Reasons` (every dropped series with `rejected_because`, plus the counts).
 
 ```bat
 python 06_build_af_cohort.py --pilot 10
