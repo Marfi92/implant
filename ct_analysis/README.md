@@ -158,12 +158,15 @@ Joins the clinical CSV (`Subject`, `AF_CT_Baseline`, `Sex`, `AgeAtVisitOne`, `He
 
 Kept series must be contrast CCTA, an `ORIGINAL` reconstruction, a 3D volume, `<= 1.0 mm`, `duplicate_sop_count = 0`, with at least `--min-slices` unique slice positions matching the image count. Ties are broken towards `BestDiast` / the phase closest to `--target-phase` (default 70), the `I26f` kernel, then the thinnest recon with the most slices. Controls are matched inside exact site/sex/kVp/thickness strata, then on closest age and BMI.
 
-**Output:** `af_cohort.xlsx` with `Summary`, `AF_Selected`, `Control_Selected`, `Matched_Pairs`, `Pilot_nnUNet` (one nnU-Net case per row, with the geometry columns and the `series_folder` path), and `Rejected` (every dropped series with `rejected_because`).
+**Output:** `af_cohort.xlsx` with `Summary`, `AF_Selected`, `Control_Selected`, `Matched_Pairs`, `Pilot_nnUNet` (one nnU-Net case per row, with the geometry columns and the `series_folder` path), `AF_Not_Usable` (one row per AF patient with no usable series, naming the rule that removed its closest-to-passing series), `AF_Loss_Reasons`, and `Rejected` / `Rejection_Reasons` (every dropped series with `rejected_because`, plus the counts).
 
 ```bat
 python 06_build_af_cohort.py --pilot 10
 python 06_build_af_cohort.py --site 1 --min-slices 200 --target-phase 40
+python 06_build_af_cohort.py --allow-duplicates
 ```
+
+Use `AF_Loss_Reasons` before relaxing anything. `--allow-duplicates` keeps series whose images are repeated by overlapping archive batches — script 07 then drops the repeated `SOPInstanceUID`s and keeps one file per slice position, so the written volume is still correct.
 
 `--target-phase 70` is the motion-reduced best-diastolic reconstruction available for nearly every patient; the left atrium is largest at end-systole (~30-40%), so choose the phase from the study endpoint and apply the same value to both groups.
 

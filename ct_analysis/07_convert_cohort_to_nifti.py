@@ -20,7 +20,7 @@ Usage
 In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
     from importlib import import_module
     convert = import_module("07_convert_cohort_to_nifti")
-    convert.main(["--output", r"W:\SCAPIS_nnUNet", "--limit", "4"])
+    convert.main(["--output", r"W:\\SCAPIS_nnUNet", "--limit", "4"])
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def deduplicate(files: list[str]) -> tuple[list[str], int]:
             instance = str(header.get("SOPInstanceUID", ""))
             position = header.get("ImagePositionPatient")
             z = round(float(position[2]), 3) if position else float(len(positions))
-        except Exception:
+        except (OSError, ValueError, TypeError, IndexError, KeyError):
             unreadable += 1
             continue
         if instance and instance in seen_instances:

@@ -392,7 +392,7 @@ PILOT_DETAIL_COLUMNS = [
 
 def pilot_set(pairs: pd.DataFrame, merged: pd.DataFrame, count: int) -> pd.DataFrame:
     """Balanced starter set for annotation: one nnU-Net case per row, full detail."""
-    matched = pairs[pairs["matched"] == True].head(count)  # noqa: E712
+    matched = pairs[pairs["matched"] == True].head(count)
     by_patient = merged.set_index("patient_id")
     detail = [column for column in PILOT_DETAIL_COLUMNS if column in merged.columns]
     rows: list[dict[str, object]] = []
@@ -561,7 +561,7 @@ def main(argv: list[str] | None = None) -> None:
     print()
     print("Why AF patients have no usable series:")
     for reason, count in lost_reasons.itertuples(index=False):
-        print(f"  {str(reason):<45} {count:>5}")
+        print(f"  {reason!s:<45} {count:>5}")
     print("\nNext: python 07_convert_cohort_to_nifti.py --sheet Pilot_nnUNet")
 
 
