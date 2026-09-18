@@ -12,12 +12,14 @@ Output: <output>/Dataset001_SCAPIS_LA/imagesTr/SCAPIS_001_0000.nii.gz ...
 Nothing is copied or extracted: each series is read straight from its source folder,
 written as one .nii.gz, and the reader is released before the next series starts.
 
-With --layout per-patient the same volumes are written as one folder per patient,
-named after the patient, which is what a manual segmentation session wants:
-        <output>/VALLA_1234/VALLA_1234.nii.gz          the image to segment
-        <output>/VALLA_1234/                           save VALLA_1234_seg.nii.gz here
+--layout flat writes the same volumes named after the patient, all in one folder,
+which is what a manual segmentation session wants:
+        <output>/VALLA_1234.nii.gz                     the image to segment
+        <output>/VALLA_1234_seg.nii.gz                 save your segmentation as this
         <output>/nifti_index.xlsx                      one row per patient, with paths
                                                       and the voxel spacing
+
+--layout per-patient is the same thing with one subfolder per patient.
 
 Voxel spacing and dimensions live in the NIfTI header; --info additionally drops a
 <patient_id>_info.json beside each volume.
@@ -31,7 +33,7 @@ Usage
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet"
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet" --limit 4     REM try 4 cases first
     python 07_convert_cohort_to_nifti.py --cohort af_cohort.xlsx --sheet Pilot_nnUNet
-    python 07_convert_cohort_to_nifti.py --layout per-patient --output "W:\\SCAPIS_seg"
+    python 07_convert_cohort_to_nifti.py --layout flat --output "W:\\SCAPIS_seg" --sheet All_Patients
 
 In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
     from importlib import import_module
@@ -64,9 +66,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument(
         "--layout",
-        choices=["nnunet", "per-patient"],
+        choices=["nnunet", "flat", "per-patient"],
         default="nnunet",
         help="nnunet: imagesTr/SCAPIS_001_0000.nii.gz; "
+        "flat: <patient_id>.nii.gz all in the output folder; "
         "per-patient: <patient_id>/<patient_id>.nii.gz",
     )
     parser.add_argument(
@@ -298,10 +301,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.limit:
         cohort = cohort.head(args.limit)
 
+    by_patient = args.layout in {"flat", "per-patient"}
     per_patient = args.layout == "per-patient"
     dataset_dir = args.output / args.dataset
-    images_dir = args.output if per_patient else dataset_dir / "imagesTr"
-    labels_dir = args.output if per_patient else dataset_dir / "labelsTr"
+    images_dir = args.output if by_patient else dataset_dir / "imagesTr"
+    labels_dir = args.output if by_patient else dataset_dir / "labelsTr"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -311,9 +315,10 @@ def main(argv: list[str] | None = None) -> None:
         case_id = sheet_case_id or f"SCAPIS_{position:03d}"
         patient = str(record["patient_id"])
         folder = Path(str(record["series_folder"]))
-        if per_patient:
-            target = images_dir / patient / f"{patient}.nii.gz"
-            label = target.parent / f"{patient}_seg.nii.gz"
+        if by_patient:
+            folder_for_patient = images_dir / patient if per_patient else images_dir
+            target = folder_for_patient / f"{patient}.nii.gz"
+            label = folder_for_patient / f"{patient}_seg.nii.gz"
         else:
             target = images_dir / f"{case_id}_0000.nii.gz"
             label = labels_dir / f"{case_id}.nii.gz"
@@ -364,7 +369,7 @@ def main(argv: list[str] | None = None) -> None:
         row["status"] = status
         row["error"] = error
         row.update(shape)
-        if per_patient and args.info and target.exists():
+        if by_patient and args.info and target.exists():
             row["info_file"] = str(write_patient_info(target.parent, patient, row))
         rows.append(row)
         if position % 25 == 0:
@@ -372,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
 
     log = pd.DataFrame(rows)
     log_path = write_index(log, args.output)
-    if not per_patient:
+    if not by_patient:
         write_dataset_json(dataset_dir, int((log["status"] != "failed").sum()))
 
     overview = [
@@ -394,7 +399,7 @@ def main(argv: list[str] | None = None) -> None:
     print()
     print(log[overview].to_string(index=False))
     print(f"\nImages : {images_dir}")
-    if per_patient:
+    if by_patient:
         print("Labels : next to each image, as <patient_id>_seg.nii.gz")
     else:
         print(f"Labels : {labels_dir}  (put your segmentations here, same case_id)")
