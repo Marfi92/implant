@@ -16,6 +16,11 @@ Usage
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet"
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet" --limit 4     REM try 4 cases first
     python 07_convert_cohort_to_nifti.py --cohort af_cohort.xlsx --sheet Pilot_nnUNet
+
+In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
+    from importlib import import_module
+    convert = import_module("07_convert_cohort_to_nifti")
+    convert.main(["--output", r"W:\SCAPIS_nnUNet", "--limit", "4"])
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ OUTPUT = Path(r"W:\SCAPIS_nnUNet")
 DATASET = "Dataset001_SCAPIS_LA"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cohort", type=Path, default=COHORT)
     parser.add_argument("--sheet", default="Pilot_nnUNet")
@@ -47,7 +52,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="rewrite files that already exist (default: skip, so the run resumes)",
     )
-    return parser.parse_args()
+    # parse_known_args so the notebook kernel's own -f argument is ignored
+    return parser.parse_known_args(argv)[0]
 
 
 def series_files(folder: Path, series_uid: str) -> list[str]:
@@ -115,8 +121,8 @@ def write_dataset_json(dataset_dir: Path, cases: int) -> None:
     (dataset_dir / "dataset.json").write_text(json.dumps(content, indent=2))
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     cohort = pd.read_excel(args.cohort, sheet_name=args.sheet, dtype=str)
     if args.limit:
         cohort = cohort.head(args.limit)

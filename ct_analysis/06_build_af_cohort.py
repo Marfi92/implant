@@ -20,6 +20,11 @@ Usage
     python 06_build_af_cohort.py
     python 06_build_af_cohort.py --pilot 10 --site 1
     python 06_build_af_cohort.py --min-slices 200 --target-phase 40
+
+In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
+    from importlib import import_module
+    build = import_module("06_build_af_cohort")
+    build.main(["--pilot", "10"])
 """
 
 from __future__ import annotations
@@ -90,7 +95,7 @@ CLINICAL_COLUMNS = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--series-csv", type=Path, default=SERIES_CSV)
     parser.add_argument("--clinical-csv", type=Path, default=CLINICAL_CSV)
@@ -126,7 +131,8 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="maximum age difference within a matched pair (default 5 years)",
     )
-    return parser.parse_args()
+    # parse_known_args so the notebook kernel's own -f argument is ignored
+    return parser.parse_known_args(argv)[0]
 
 
 def sanitize(frame: pd.DataFrame) -> pd.DataFrame:
@@ -393,8 +399,8 @@ def pilot_set(pairs: pd.DataFrame, merged: pd.DataFrame, count: int) -> pd.DataF
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     print(f"Reading {args.series_csv} ...")
     series = pd.read_csv(args.series_csv, dtype=str, low_memory=False)
