@@ -126,6 +126,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="matched pairs to put in the pilot annotation set (default 10)",
     )
     parser.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help=(
+            "keep series whose images are repeated by overlapping archive batches "
+            "(script 07 then converts the de-duplicated slices)"
+        ),
+    )
+    parser.add_argument(
         "--age-tolerance",
         type=float,
         default=5.0,
@@ -229,7 +237,10 @@ def prepare_series(frame: pd.DataFrame, target_phase: float) -> pd.DataFrame:
 
 
 def filter_candidates(
-    table: pd.DataFrame, min_slices: int, max_thickness: float
+    table: pd.DataFrame,
+    min_slices: int,
+    max_thickness: float,
+    allow_duplicates: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Keep only series usable for left-atrium segmentation."""
     reasons = pd.Series("", index=table.index)
@@ -244,13 +255,16 @@ def filter_candidates(
         (table["thickness"].isna(), "missing SliceThickness"),
         (table["thickness"] > max_thickness, f"thicker than {max_thickness} mm"),
         (table["slices"] < min_slices, f"fewer than {min_slices} slice positions"),
-        (table["duplicates"] > 0, "duplicate SOPInstanceUID"),
-        (
-            (table["sop_instances"] > 0)
-            & ((table["slices"] - table["sop_instances"]).abs() > 2),
-            "slice positions do not match image count",
-        ),
     ]
+    if not allow_duplicates:
+        checks += [
+            (table["duplicates"] > 0, "duplicate SOPInstanceUID"),
+            (
+                (table["sop_instances"] > 0)
+                & ((table["slices"] - table["sop_instances"]).abs() > 2),
+                "slice positions do not match image count",
+            ),
+        ]
     for condition, reason in checks:
         reasons = reasons.mask((reasons == "") & condition.fillna(False), reason)
 
@@ -342,7 +356,11 @@ def match_pairs(
                 "matched": True,
             }
         )
-    return pd.DataFrame(pairs)
+    table = pd.DataFrame(pairs)
+    for column in ["af_patient_id", "matched", "control_patient_id"]:
+        if column not in table.columns:
+            table[column] = False if column == "matched" else pd.NA
+    return table
 
 
 PILOT_DETAIL_COLUMNS = [
@@ -399,6 +417,61 @@ def pilot_set(pairs: pd.DataFrame, merged: pd.DataFrame, count: int) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+def af_not_usable(
+    table: pd.DataFrame, dropped: pd.DataFrame, clinical: pd.DataFrame, kept_ids: set[str]
+) -> pd.DataFrame:
+    """One row per AF patient without a usable series, and the rule that removed it.
+
+    The reason shown is the one from that patient's closest-to-passing series (the
+    contrast CCTA row with the most slice positions), so relaxing that single rule
+    tells you how many AF patients you would recover.
+    """
+    af_ids = set(clinical.loc[clinical["af"] == "YES", "patient_id"])
+    missing = af_ids - kept_ids
+    with_series = set(table.loc[table["patient_id"].isin(missing), "patient_id"])
+    rows: list[dict[str, object]] = []
+    for patient in sorted(missing - with_series):
+        rows.append(
+            {
+                "patient_id": patient,
+                "reason": "no CT series in the inventory",
+                "series_description": "",
+                "slices": 0,
+                "duplicate_sop_count": "",
+                "slice_thickness_mm": "",
+            }
+        )
+    candidates = dropped[dropped["patient_id"].isin(with_series)]
+    preferred = candidates[
+        candidates["series_role"].astype(str).isin(["ccta", "probable_ccta"])
+    ]
+    for patient, group in (preferred if not preferred.empty else candidates).groupby(
+        "patient_id"
+    ):
+        best = group.sort_values("slices", ascending=False).iloc[0]
+        rows.append(
+            {
+                "patient_id": str(patient),
+                "reason": best["rejected_because"],
+                "series_description": best.get("series_description", ""),
+                "slices": best["slices"],
+                "duplicate_sop_count": best.get("duplicate_sop_count", ""),
+                "slice_thickness_mm": best.get("slice_thickness_mm", ""),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "patient_id",
+            "reason",
+            "series_description",
+            "slices",
+            "duplicate_sop_count",
+            "slice_thickness_mm",
+        ],
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -408,7 +481,9 @@ def main(argv: list[str] | None = None) -> None:
         series = series[series["site_number"].astype(str) == str(args.site)]
     table = prepare_series(series, args.target_phase)
 
-    kept, dropped = filter_candidates(table, args.min_slices, args.max_thickness)
+    kept, dropped = filter_candidates(
+        table, args.min_slices, args.max_thickness, args.allow_duplicates
+    )
     selected = pick_one_per_patient(kept)
 
     print(f"Reading {args.clinical_csv} ...")
@@ -421,6 +496,13 @@ def main(argv: list[str] | None = None) -> None:
     pairs = match_pairs(af_table, control_table, args.age_tolerance)
     matched_controls = set(pairs.loc[pairs["matched"], "control_patient_id"])
     pilot = pilot_set(pairs, merged, args.pilot)
+    lost = af_not_usable(table, dropped, clinical, set(selected["patient_id"]))
+    reasons = (
+        dropped["rejected_because"].value_counts().rename("series").reset_index()
+    )
+    reasons.columns = ["rejected_because", "series"]
+    lost_reasons = lost["reason"].value_counts().rename("af_patients").reset_index()
+    lost_reasons.columns = ["reason", "af_patients"]
 
     summary = pd.DataFrame(
         [
@@ -429,7 +511,9 @@ def main(argv: list[str] | None = None) -> None:
             ("candidate CCTA series", len(kept)),
             ("patients with a usable CCTA series", len(selected)),
             ("of those, present in the clinical CSV", len(merged)),
+            ("AF patients in the clinical CSV", int((clinical["af"] == "YES").sum())),
             ("AF patients with a usable series", len(af_table)),
+            ("AF patients without a usable series", len(lost)),
             ("non-AF patients with a usable series", len(control_table)),
             ("AF patients successfully matched 1:1", int(pairs["matched"].sum())),
             ("AF patients without a match", int((~pairs["matched"]).sum())),
@@ -460,6 +544,13 @@ def main(argv: list[str] | None = None) -> None:
         )
         sanitize(pairs).to_excel(writer, sheet_name="Matched_Pairs", index=False)
         sanitize(pilot).to_excel(writer, sheet_name="Pilot_nnUNet", index=False)
+        sanitize(lost).to_excel(writer, sheet_name="AF_Not_Usable", index=False)
+        sanitize(lost_reasons).to_excel(
+            writer, sheet_name="AF_Loss_Reasons", index=False
+        )
+        sanitize(reasons).to_excel(
+            writer, sheet_name="Rejection_Reasons", index=False
+        )
         sanitize(
             dropped[
                 [column for column in image_columns if column in dropped.columns]
@@ -467,7 +558,11 @@ def main(argv: list[str] | None = None) -> None:
             ].head(200_000)
         ).to_excel(writer, sheet_name="Rejected", index=False)
     print(f"\nWrote {args.output}")
-    print("Next: python 07_convert_cohort_to_nifti.py --cohort af_cohort.xlsx --sheet Pilot_nnUNet")
+    print()
+    print("Why AF patients have no usable series:")
+    for reason, count in lost_reasons.itertuples(index=False):
+        print(f"  {str(reason):<45} {count:>5}")
+    print("\nNext: python 07_convert_cohort_to_nifti.py --sheet Pilot_nnUNet")
 
 
 if __name__ == "__main__":

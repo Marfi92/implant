@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import pydicom
 import SimpleITK as sitk
 
 COHORT = Path(r"Q:\users\marfi\CT_analysis\af_cohort.xlsx")
@@ -67,6 +68,33 @@ def series_files(folder: Path, series_uid: str) -> list[str]:
     return []
 
 
+def deduplicate(files: list[str]) -> tuple[list[str], int]:
+    """Drop repeated images, keep one file per slice position, sort along z.
+
+    Overlapping archive batches export the same image twice; a series that still
+    holds those repeats cannot be read as a volume until they are removed.
+    """
+    positions: dict[float, tuple[float, str]] = {}
+    seen_instances: set[str] = set()
+    unreadable = 0
+    for name in files:
+        try:
+            header = pydicom.dcmread(name, stop_before_pixels=True, force=True)
+            instance = str(header.get("SOPInstanceUID", ""))
+            position = header.get("ImagePositionPatient")
+            z = round(float(position[2]), 3) if position else float(len(positions))
+        except Exception:
+            unreadable += 1
+            continue
+        if instance and instance in seen_instances:
+            continue
+        if instance:
+            seen_instances.add(instance)
+        positions.setdefault(z, (z, name))
+    ordered = [name for _, name in sorted(positions.values())]
+    return ordered, len(files) - len(ordered) - unreadable
+
+
 def geometry(image: sitk.Image) -> dict[str, object]:
     spacing = image.GetSpacing()
     size = image.GetSize()
@@ -100,14 +128,18 @@ def convert_one(
     files = series_files(folder, series_uid)
     if not files:
         return 0, {}, "SeriesInstanceUID not found in the folder"
+    unique, removed = deduplicate(files)
+    if len(unique) < 3:
+        return 0, {}, f"only {len(unique)} usable slices after de-duplication"
     reader = sitk.ImageSeriesReader()
-    reader.SetFileNames(files)
+    reader.SetFileNames(unique)
     image = reader.Execute()
     target.parent.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(image, str(target), useCompression=True)
     shape = geometry(image)
+    shape["duplicate_slices_removed"] = removed
     del image, reader
-    return len(files), shape, ""
+    return len(unique), shape, ""
 
 
 def write_dataset_json(dataset_dir: Path, cases: int) -> None:
