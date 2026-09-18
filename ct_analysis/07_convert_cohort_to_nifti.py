@@ -12,10 +12,17 @@ Output: <output>/Dataset001_SCAPIS_LA/imagesTr/SCAPIS_001_0000.nii.gz ...
 Nothing is copied or extracted: each series is read straight from its source folder,
 written as one .nii.gz, and the reader is released before the next series starts.
 
+With --layout per-patient the same volumes are written as one folder per patient,
+named after the patient, which is what a manual segmentation session wants:
+        <output>/VALLA_1234/VALLA_1234.nii.gz          the image to segment
+        <output>/VALLA_1234/                           save VALLA_1234_seg.nii.gz here
+        <output>/nifti_index.xlsx                      one row per patient, with paths
+
 Usage
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet"
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet" --limit 4     REM try 4 cases first
     python 07_convert_cohort_to_nifti.py --cohort af_cohort.xlsx --sheet Pilot_nnUNet
+    python 07_convert_cohort_to_nifti.py --layout per-patient --output "W:\\SCAPIS_seg"
 
 In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
     from importlib import import_module
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -45,6 +53,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sheet", default="Pilot_nnUNet")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument(
+        "--layout",
+        choices=["nnunet", "per-patient"],
+        default="nnunet",
+        help="nnunet: imagesTr/SCAPIS_001_0000.nii.gz; "
+        "per-patient: <patient_id>/<patient_id>.nii.gz",
+    )
+    parser.add_argument(
+        "--copy-from",
+        type=Path,
+        default=None,
+        help="folder holding already converted volumes "
+        "(e.g. W:\\SCAPIS_nnUNet\\Dataset001_SCAPIS_LA\\imagesTr); "
+        "a matching file is copied instead of read from DICOM again",
+    )
     parser.add_argument(
         "--limit", type=int, default=0, help="convert only the first N cases"
     )
@@ -119,6 +142,23 @@ def geometry(image: sitk.Image) -> dict[str, object]:
     }
 
 
+def existing_volume(source: Path | None, case_id: str, patient: str) -> Path | None:
+    """An already converted .nii.gz for this case, under any of the usual names."""
+    if source is None or not source.exists():
+        return None
+    names = [
+        f"{case_id}_0000.nii.gz",
+        f"{case_id}.nii.gz",
+        f"{patient}_0000.nii.gz",
+        f"{patient}.nii.gz",
+    ]
+    for name in names:
+        for candidate in (source / name, source / patient / name):
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def convert_one(
     folder: Path, series_uid: str, target: Path
 ) -> tuple[int, dict[str, object], str]:
@@ -159,25 +199,41 @@ def main(argv: list[str] | None = None) -> None:
     if args.limit:
         cohort = cohort.head(args.limit)
 
+    per_patient = args.layout == "per-patient"
     dataset_dir = args.output / args.dataset
-    images_dir = dataset_dir / "imagesTr"
-    labels_dir = dataset_dir / "labelsTr"
+    images_dir = args.output if per_patient else dataset_dir / "imagesTr"
+    labels_dir = args.output if per_patient else dataset_dir / "labelsTr"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, object]] = []
     for position, record in enumerate(cohort.to_dict("records"), start=1):
-        case_id = str(record["case_id"])
+        case_id = str(record.get("case_id", f"SCAPIS_{position:03d}"))
+        patient = str(record["patient_id"])
         folder = Path(str(record["series_folder"]))
-        target = images_dir / f"{case_id}_0000.nii.gz"
+        if per_patient:
+            target = images_dir / patient / f"{patient}.nii.gz"
+            label = target.parent / f"{patient}_seg.nii.gz"
+        else:
+            target = images_dir / f"{case_id}_0000.nii.gz"
+            label = labels_dir / f"{case_id}.nii.gz"
         print(
-            f"[{position}/{len(cohort)}] {case_id} "
-            f"{record['group']} {record['patient_id']}"
+            f"[{position}/{len(cohort)}] {case_id} {record.get('group', '')} {patient}"
         )
 
         started = time.time()
+        source_volume = existing_volume(args.copy_from, case_id, patient)
         try:
-            if target.exists() and not args.overwrite:
+            if (
+                source_volume is not None
+                and source_volume != target
+                and (args.overwrite or not target.exists())
+            ):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_volume, target)
+                slices, shape, error = 0, geometry(sitk.ReadImage(str(target))), ""
+                status = f"copied from {source_volume.name}"
+            elif target.exists() and not args.overwrite:
                 slices, shape, error = (
                     0,
                     geometry(sitk.ReadImage(str(target))),
@@ -199,7 +255,8 @@ def main(argv: list[str] | None = None) -> None:
         row: dict[str, object] = dict(record)
         row["dicom_folder"] = str(folder)
         row["nifti_file"] = str(target)
-        row["label_file_to_create"] = str(labels_dir / f"{case_id}.nii.gz")
+        row["patient_folder"] = str(target.parent)
+        row["label_file_to_create"] = str(label)
         row["slices_converted"] = slices
         row["nifti_size_mb"] = (
             round(target.stat().st_size / 1024 / 1024, 1) if target.exists() else 0
@@ -213,9 +270,11 @@ def main(argv: list[str] | None = None) -> None:
     log_path = args.output / "nifti_index.xlsx"
     with pd.ExcelWriter(log_path, engine="openpyxl") as writer:
         log.to_excel(writer, sheet_name="Images", index=False)
-        log.groupby("group")["status"].value_counts().rename("cases").reset_index(
-        ).to_excel(writer, sheet_name="Summary", index=False)
-    write_dataset_json(dataset_dir, int((log["status"] != "failed").sum()))
+        log.groupby("group")["status"].value_counts().rename(
+            "cases"
+        ).reset_index().to_excel(writer, sheet_name="Summary", index=False)
+    if not per_patient:
+        write_dataset_json(dataset_dir, int((log["status"] != "failed").sum()))
 
     overview = [
         column
@@ -236,7 +295,10 @@ def main(argv: list[str] | None = None) -> None:
     print()
     print(log[overview].to_string(index=False))
     print(f"\nImages : {images_dir}")
-    print(f"Labels : {labels_dir}  (put your segmentations here, same case_id)")
+    if per_patient:
+        print("Labels : next to each image, as <patient_id>_seg.nii.gz")
+    else:
+        print(f"Labels : {labels_dir}  (put your segmentations here, same case_id)")
     print(f"Excel  : {log_path}")
 
 

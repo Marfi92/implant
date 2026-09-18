@@ -183,6 +183,13 @@ python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet" --limit 4
 python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet"
 ```
 
+`--layout per-patient` writes one folder per patient instead of the nnU-Net layout — `<output>\<patient_id>\<patient_id>.nii.gz`, with the segmentation to be saved next to it as `<patient_id>_seg.nii.gz`. `--copy-from` points at a folder of volumes that were already converted, and those are copied under the patient name instead of being read from DICOM again.
+
+```bat
+python 07_convert_cohort_to_nifti.py --layout per-patient --output "W:\SCAPIS_seg"
+python 07_convert_cohort_to_nifti.py --layout per-patient --output "W:\SCAPIS_seg" --copy-from "W:\SCAPIS_nnUNet\Dataset001_SCAPIS_LA\imagesTr"
+```
+
 ---
 
 ### 8. `08_add_ct_status_to_clinical.py` — clinical CSV plus CT status per patient
