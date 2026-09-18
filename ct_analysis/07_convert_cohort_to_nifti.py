@@ -15,8 +15,15 @@ written as one .nii.gz, and the reader is released before the next series starts
 With --layout per-patient the same volumes are written as one folder per patient,
 named after the patient, which is what a manual segmentation session wants:
         <output>/VALLA_1234/VALLA_1234.nii.gz          the image to segment
+        <output>/VALLA_1234/VALLA_1234_info.json       voxel spacing, dimensions, FOV,
+                                                      kVp, kernel, phase, source folder
         <output>/VALLA_1234/                           save VALLA_1234_seg.nii.gz here
         <output>/nifti_index.xlsx                      one row per patient, with paths
+
+Any sheet works as input: af_cohort.xlsx (Pilot_nnUNet, AF_Selected, All_Patients) or
+SCAPIS_clinical_with_CT_status.xlsx (Patients). Only rows marked ok for segmentation
+are converted, so `--sheet All_Patients` gives every usable patient in the cohort;
+--include-not-ok also tries the rejected ones.
 
 Usage
     python 07_convert_cohort_to_nifti.py --output "W:\\SCAPIS_nnUNet"
@@ -67,6 +74,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="folder holding already converted volumes "
         "(e.g. W:\\SCAPIS_nnUNet\\Dataset001_SCAPIS_LA\\imagesTr); "
         "a matching file is copied instead of read from DICOM again",
+    )
+    parser.add_argument(
+        "--include-not-ok",
+        action="store_true",
+        help="also try rows the quality rules rejected "
+        "(default: only rows marked ok for segmentation)",
     )
     parser.add_argument(
         "--limit", type=int, default=0, help="convert only the first N cases"
@@ -143,15 +156,16 @@ def geometry(image: sitk.Image) -> dict[str, object]:
 
 
 def existing_volume(source: Path | None, case_id: str, patient: str) -> Path | None:
-    """An already converted .nii.gz for this case, under any of the usual names."""
+    """An already converted .nii.gz for this case, under any of the usual names.
+
+    case_id is only trusted when the sheet supplied one: a number invented here
+    would happily match another patient's file.
+    """
     if source is None or not source.exists():
         return None
-    names = [
-        f"{case_id}_0000.nii.gz",
-        f"{case_id}.nii.gz",
-        f"{patient}_0000.nii.gz",
-        f"{patient}.nii.gz",
-    ]
+    names = [f"{patient}_0000.nii.gz", f"{patient}.nii.gz"]
+    if case_id:
+        names += [f"{case_id}_0000.nii.gz", f"{case_id}.nii.gz"]
     for name in names:
         for candidate in (source / name, source / patient / name):
             if candidate.exists():
@@ -182,6 +196,64 @@ def convert_one(
     return len(unique), shape, ""
 
 
+def usable_rows(cohort: pd.DataFrame, include_not_ok: bool) -> pd.DataFrame:
+    """Keep the rows that carry a series and, unless asked, only the ok ones."""
+    if "patient_id" not in cohort.columns:
+        for name in ["Subject", "subject", "SubjectID"]:
+            if name in cohort.columns:
+                cohort = cohort.rename(columns={name: "patient_id"})
+                break
+    if not include_not_ok:
+        for column in ["segmentation_ready", "usable"]:
+            if column in cohort.columns:
+                cohort = cohort[
+                    cohort[column].astype(str).str.strip().str.lower() == "ok"
+                ]
+                break
+    if "series_folder" in cohort.columns:
+        cohort = cohort[cohort["series_folder"].notna()]
+    return cohort.drop_duplicates(subset=["patient_id"], keep="first").reset_index(
+        drop=True
+    )
+
+
+def write_patient_info(folder: Path, patient: str, row: dict[str, object]) -> Path:
+    """Voxel spacing, dimensions and acquisition parameters next to the volume."""
+    keys = [
+        "group",
+        "series_description",
+        "slice_thickness_mm",
+        "kvp",
+        "convolution_kernel",
+        "phase_percent",
+        "heart_rate_bpm",
+        "dim_x",
+        "dim_y",
+        "dim_z",
+        "spacing_x_mm",
+        "spacing_y_mm",
+        "spacing_z_mm",
+        "fov_x_mm",
+        "fov_y_mm",
+        "coverage_z_mm",
+        "origin",
+        "direction",
+        "hu_min",
+        "hu_max",
+        "slices_converted",
+        "duplicate_slices_removed",
+        "dicom_folder",
+        "nifti_file",
+    ]
+    content = {"patient_id": patient}
+    content.update(
+        {key: row[key] for key in keys if key in row and pd.notna(row.get(key))}
+    )
+    path = folder / f"{patient}_info.json"
+    path.write_text(json.dumps(content, indent=2, default=str))
+    return path
+
+
 def write_dataset_json(dataset_dir: Path, cases: int) -> None:
     content = {
         "channel_names": {"0": "CT"},
@@ -193,9 +265,28 @@ def write_dataset_json(dataset_dir: Path, cases: int) -> None:
     (dataset_dir / "dataset.json").write_text(json.dumps(content, indent=2))
 
 
+def write_index(log: pd.DataFrame, output: Path) -> Path:
+    """One row per patient, rewritten as the run proceeds so nothing is lost."""
+    path = output / "nifti_index.xlsx"
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        log.to_excel(writer, sheet_name="Images", index=False)
+        counts = (
+            log.groupby("group")["status"].value_counts()
+            if "group" in log.columns
+            else log["status"].value_counts()
+        )
+        counts.rename("cases").reset_index().to_excel(
+            writer, sheet_name="Summary", index=False
+        )
+    return path
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     cohort = pd.read_excel(args.cohort, sheet_name=args.sheet, dtype=str)
+    before = len(cohort)
+    cohort = usable_rows(cohort, args.include_not_ok)
+    print(f"{before} rows in sheet {args.sheet}, {len(cohort)} to convert")
     if args.limit:
         cohort = cohort.head(args.limit)
 
@@ -208,7 +299,8 @@ def main(argv: list[str] | None = None) -> None:
 
     rows: list[dict[str, object]] = []
     for position, record in enumerate(cohort.to_dict("records"), start=1):
-        case_id = str(record.get("case_id", f"SCAPIS_{position:03d}"))
+        sheet_case_id = str(record.get("case_id") or "")
+        case_id = sheet_case_id or f"SCAPIS_{position:03d}"
         patient = str(record["patient_id"])
         folder = Path(str(record["series_folder"]))
         if per_patient:
@@ -222,7 +314,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         started = time.time()
-        source_volume = existing_volume(args.copy_from, case_id, patient)
+        source_volume = existing_volume(args.copy_from, sheet_case_id, patient)
         try:
             if (
                 source_volume is not None
@@ -242,7 +334,7 @@ def main(argv: list[str] | None = None) -> None:
                 status = "already converted"
             else:
                 slices, shape, error = convert_one(
-                    folder, str(record["series_uid"]), target
+                    folder, str(record.get("series_uid", "")), target
                 )
                 status = "ok" if not error else "failed"
         except Exception as problem:  # a single bad series must not stop the run
@@ -264,15 +356,14 @@ def main(argv: list[str] | None = None) -> None:
         row["status"] = status
         row["error"] = error
         row.update(shape)
+        if per_patient and target.exists():
+            row["info_file"] = str(write_patient_info(target.parent, patient, row))
         rows.append(row)
+        if position % 25 == 0:
+            write_index(pd.DataFrame(rows), args.output)
 
     log = pd.DataFrame(rows)
-    log_path = args.output / "nifti_index.xlsx"
-    with pd.ExcelWriter(log_path, engine="openpyxl") as writer:
-        log.to_excel(writer, sheet_name="Images", index=False)
-        log.groupby("group")["status"].value_counts().rename(
-            "cases"
-        ).reset_index().to_excel(writer, sheet_name="Summary", index=False)
+    log_path = write_index(log, args.output)
     if not per_patient:
         write_dataset_json(dataset_dir, int((log["status"] != "failed").sum()))
 
