@@ -152,6 +152,36 @@ python 05_check_site_coverage.py --sample 0
 
 ---
 
+### 6. `06_build_af_cohort.py` — AF vs non-AF CCTA cohort for LA segmentation
+
+Joins the clinical CSV (`Subject`, `AF_CT_Baseline`, `Sex`, `AgeAtVisitOne`, `Height`, `Weight`) to `all_series_inventory.csv`, keeps only series usable for left-atrium and atrial-fat segmentation, picks one series per patient, and matches AF patients 1:1 to non-AF controls.
+
+Kept series must be contrast CCTA, an `ORIGINAL` reconstruction, a 3D volume, `<= 1.0 mm`, `duplicate_sop_count = 0`, with at least `--min-slices` unique slice positions matching the image count. Ties are broken towards `BestDiast` / the phase closest to `--target-phase` (default 70), the `I26f` kernel, then the thinnest recon with the most slices. Controls are matched inside exact site/sex/kVp/thickness strata, then on closest age and BMI.
+
+**Output:** `af_cohort.xlsx` with `Summary`, `AF_Selected`, `Control_Selected`, `Matched_Pairs`, `Pilot_nnUNet` (one nnU-Net case per row, with the geometry columns and the `series_folder` path), and `Rejected` (every dropped series with `rejected_because`).
+
+```bat
+python 06_build_af_cohort.py --pilot 10
+python 06_build_af_cohort.py --site 1 --min-slices 200 --target-phase 40
+```
+
+`--target-phase 70` is the motion-reduced best-diastolic reconstruction available for nearly every patient; the left atrium is largest at end-systole (~30-40%), so choose the phase from the study endpoint and apply the same value to both groups.
+
+---
+
+### 7. `07_convert_cohort_to_nifti.py` — cohort DICOM to nnU-Net NIfTI
+
+Converts the cohort sheet to `<output>/Dataset001_SCAPIS_LA/imagesTr/<case_id>_0000.nii.gz`, one series at a time, reading each series straight from its source folder so nothing is staged or extracted. Existing files are skipped, so an interrupted run resumes.
+
+`<output>/nifti_index.xlsx` lists one row per patient: AF/control group, clinical values, acquisition parameters, the DICOM folder, the NIfTI path, the label file to create, and the geometry read back out of the written volume (dimensions, voxel spacing, FOV, z coverage, origin, direction, HU range).
+
+```bat
+python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet" --limit 4
+python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet"
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
