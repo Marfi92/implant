@@ -15,10 +15,12 @@ written as one .nii.gz, and the reader is released before the next series starts
 With --layout per-patient the same volumes are written as one folder per patient,
 named after the patient, which is what a manual segmentation session wants:
         <output>/VALLA_1234/VALLA_1234.nii.gz          the image to segment
-        <output>/VALLA_1234/VALLA_1234_info.json       voxel spacing, dimensions, FOV,
-                                                      kVp, kernel, phase, source folder
         <output>/VALLA_1234/                           save VALLA_1234_seg.nii.gz here
         <output>/nifti_index.xlsx                      one row per patient, with paths
+                                                      and the voxel spacing
+
+Voxel spacing and dimensions live in the NIfTI header; --info additionally drops a
+<patient_id>_info.json beside each volume.
 
 Any sheet works as input: af_cohort.xlsx (Pilot_nnUNet, AF_Selected, All_Patients) or
 SCAPIS_clinical_with_CT_status.xlsx (Patients). Only rows marked ok for segmentation
@@ -74,6 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="folder holding already converted volumes "
         "(e.g. W:\\SCAPIS_nnUNet\\Dataset001_SCAPIS_LA\\imagesTr); "
         "a matching file is copied instead of read from DICOM again",
+    )
+    parser.add_argument(
+        "--info",
+        action="store_true",
+        help="also write <patient_id>_info.json beside each volume; "
+        "spacing is in the NIfTI header and in nifti_index.xlsx either way",
     )
     parser.add_argument(
         "--include-not-ok",
@@ -356,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
         row["status"] = status
         row["error"] = error
         row.update(shape)
-        if per_patient and target.exists():
+        if per_patient and args.info and target.exists():
             row["info_file"] = str(write_patient_info(target.parent, patient, row))
         rows.append(row)
         if position % 25 == 0:

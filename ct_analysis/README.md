@@ -183,7 +183,7 @@ python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet" --limit 4
 python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet"
 ```
 
-`--layout per-patient` writes one folder per patient instead of the nnU-Net layout — `<output>\<patient_id>\<patient_id>.nii.gz`, the segmentation to be saved beside it as `<patient_id>_seg.nii.gz`, and `<patient_id>_info.json` holding the voxel spacing, dimensions, FOV, z coverage, origin/direction, HU range, slice thickness, kVp, kernel, phase and the source DICOM folder. `--copy-from` points at a folder of volumes that were already converted, and a volume named after that patient is copied instead of being read from DICOM again.
+`--layout per-patient` writes one folder per patient instead of the nnU-Net layout — `<output>\<patient_id>\<patient_id>.nii.gz`, and the segmentation to be saved beside it as `<patient_id>_seg.nii.gz`. Voxel spacing and dimensions are in the NIfTI header and in `nifti_index.xlsx`; `--info` additionally writes `<patient_id>_info.json` beside each volume. `--copy-from` points at a folder of volumes that were already converted, and a volume named after that patient is copied instead of being read from DICOM again.
 
 Any sheet can drive it — `Pilot_nnUNet`, `AF_Selected`, `All_Patients`, or the `Patients` sheet of `SCAPIS_clinical_with_CT_status.xlsx`. Only rows marked ok for segmentation are converted (`--include-not-ok` overrides), so `--sheet All_Patients` converts every usable patient. `nifti_index.xlsx` is rewritten every 25 cases, so a long run can be interrupted and resumed.
 
