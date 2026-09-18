@@ -185,6 +185,17 @@ python 07_convert_cohort_to_nifti.py --output "W:\SCAPIS_nnUNet"
 
 ---
 
+### 8. `08_add_ct_status_to_clinical.py` — clinical CSV plus CT status per patient
+
+Writes `SCAPIS_clinical_with_CT_status.xlsx`: your clinical CSV with every original column untouched, plus `ct_available` (YES/NO), `segmentation_ready` (ok / not ok), `why` (one sentence — either why that series suits LA and atrial-fat work, or the single rule that removed it), the chosen series and its parameters, and `series_folder` / `example_file`. It imports the selection rules from script 6, so both always agree on "usable".
+
+```bat
+python 08_add_ct_status_to_clinical.py
+python 08_add_ct_status_to_clinical.py --allow-duplicates
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
