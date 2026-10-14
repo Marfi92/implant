@@ -7,7 +7,9 @@ which is what most patients have when no thin reconstruction was stored.
 
 Automatic check: a 3 mm series is only kept when it has enough slice positions to
 cover the heart (--min-slices, default 40 = about 120 mm at 3 mm), has an ORIGINAL
-reconstruction, contrast in the header, and no duplicated or missing slices.
+reconstruction, the requested contrast state (--require-contrast, the default,
+--non-contrast-only, or --allow-non-contrast for both), and no duplicated or
+missing slices.
 Series with too few slices are never converted; they are listed in the Excel file
 under Too_Few_Slices so nothing is silently lost.
 
@@ -33,6 +35,7 @@ Usage
     python 09_build_3mm_cohort.py
     python 09_build_3mm_cohort.py --min-thickness 2.0 --max-thickness 3.5
     python 09_build_3mm_cohort.py --min-slices 50
+    python 09_build_3mm_cohort.py --non-contrast-only --output ct_3mm_noncontrast.xlsx
 
 In a Jupyter cell, pass the options as a list instead of relying on sys.argv:
     from importlib import import_module
@@ -114,15 +117,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-contrast",
-        action="store_true",
-        default=True,
+        dest="contrast",
+        action="store_const",
+        const="contrast",
+        default="contrast",
         help="keep only series with contrast in the header (default)",
     )
     parser.add_argument(
         "--allow-non-contrast",
-        dest="require_contrast",
-        action="store_false",
-        help="also keep non-contrast 3 mm series",
+        dest="contrast",
+        action="store_const",
+        const="any",
+        help="keep contrast and non-contrast 3 mm series",
+    )
+    parser.add_argument(
+        "--non-contrast-only",
+        dest="contrast",
+        action="store_const",
+        const="non-contrast",
+        help="keep only series without contrast in the header "
+        "(the calcium scoring reconstruction)",
     )
     parser.add_argument(
         "--target-phase",
@@ -138,7 +152,7 @@ def filter_3mm(
     min_thickness: float,
     max_thickness: float,
     min_slices: int,
-    require_contrast: bool,
+    contrast: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Keep usable thick-slice volumes; return (kept, dropped-with-reason)."""
     reasons = pd.Series("", index=table.index)
@@ -158,8 +172,10 @@ def filter_3mm(
         ),
         (table["slices"] < min_slices, f"fewer than {min_slices} slice positions"),
     ]
-    if require_contrast:
+    if contrast == "contrast":
         checks.insert(2, (~table["contrast"], "no contrast agent in the header"))
+    elif contrast == "non-contrast":
+        checks.insert(2, (table["contrast"], "contrast agent in the header"))
 
     for condition, reason in checks:
         reasons = reasons.mask((reasons == "") & condition.fillna(False), reason)
@@ -184,7 +200,7 @@ def main(argv: list[str] | None = None) -> None:
         args.min_thickness,
         args.max_thickness,
         args.min_slices,
-        args.require_contrast,
+        args.contrast,
     )
     selected = build_af.pick_one_per_patient(kept)
 
@@ -235,7 +251,8 @@ def main(argv: list[str] | None = None) -> None:
             ("series in the inventory", len(table)),
             ("rejected series", len(dropped)),
             (
-                f"candidate {args.min_thickness}-{args.max_thickness} mm series",
+                f"candidate {args.min_thickness}-{args.max_thickness} mm "
+                f"{args.contrast} series",
                 len(kept),
             ),
             ("patients with a usable 3 mm series", len(selected)),
