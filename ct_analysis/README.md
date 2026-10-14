@@ -205,6 +205,21 @@ python 08_add_ct_status_to_clinical.py --allow-duplicates
 
 ---
 
+### 9. `09_build_3mm_cohort.py` — the thick-slice (3 mm) cohort
+
+Same selection as script 6 but for the low resolution reconstruction: contrast series with a slice thickness between `--min-thickness` and `--max-thickness` (default 2.0–3.5 mm), ORIGINAL reconstruction, no duplicated or missing slices, and at least `--min-slices` slice positions (default 40 ≈ 120 mm of coverage at 3 mm). Series with too few slices are never converted and are listed in the `Too_Few_Slices` sheet, so poor coverage never reaches the segmentation folder.
+
+`ct_3mm_cohort.xlsx` has `Summary`, `All_Patients` (one row per clinical patient with `segmentation_ready`), `Selected` (the chosen series, the input for script 7), `Too_Few_Slices`, and `Rejected`.
+
+```bat
+python 09_build_3mm_cohort.py
+python 07_convert_cohort_to_nifti.py --cohort "Q:\users\marfi\CT_analysis\ct_3mm_cohort.xlsx" --sheet Selected --layout flat --output "W:\SCAPIS_seg_lowres_3mm"
+```
+
+`--allow-non-contrast` keeps the non-contrast 3 mm series as well; `--min-slices 50` is stricter about coverage.
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
