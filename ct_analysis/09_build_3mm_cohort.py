@@ -15,6 +15,9 @@ Input : all_series_inventory_6sites.csv  (04_build_site_dicom_inventories.py)
         SCAPIS clinical CSV
 Output: ct_3mm_cohort.xlsx
         Summary          - how many series/patients survive each filter
+        Per_Site         - series and selected patients per site, so a missing site
+                           (sites 5 and 6 were once absent from a stale inventory)
+                           is visible before anything is converted
         All_Patients     - one row per clinical patient, segmentation_ready ok / not ok
         Selected         - the chosen 3 mm series per patient (input for script 07)
         Too_Few_Slices   - series dropped only because of poor coverage
@@ -194,6 +197,36 @@ def main(argv: list[str] | None = None) -> None:
     status = build_af.patient_status(clinical, table, dropped, selected)
     status = status.rename(columns={"usable": "segmentation_ready"})
 
+    per_site = (
+        table.groupby(["site_number", "site_name"])
+        .size()
+        .rename("series_in_inventory")
+        .reset_index()
+        .merge(
+            kept.groupby(["site_number", "site_name"])
+            .size()
+            .rename("candidate_series")
+            .reset_index(),
+            on=["site_number", "site_name"],
+            how="left",
+        )
+        .merge(
+            merged.groupby(["site_number", "site_name"])
+            .size()
+            .rename("patients_selected")
+            .reset_index(),
+            on=["site_number", "site_name"],
+            how="left",
+        )
+        .fillna({"candidate_series": 0, "patients_selected": 0})
+        .sort_values("site_number")
+    )
+    print()
+    print(per_site.to_string(index=False))
+    empty = per_site.loc[per_site["patients_selected"] == 0, "site_name"].tolist()
+    if empty:
+        print(f"WARNING: no patient selected for site(s) {', '.join(empty)}")
+
     thin = dropped[dropped["rejected_because"].str.startswith("fewer than")]
     few_patients = thin.loc[~thin["patient_id"].isin(set(selected["patient_id"]))]
 
@@ -228,6 +261,9 @@ def main(argv: list[str] | None = None) -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
         build_af.sanitize(summary).to_excel(writer, sheet_name="Summary", index=False)
+        build_af.sanitize(per_site).to_excel(
+            writer, sheet_name="Per_Site", index=False
+        )
         build_af.sanitize(status).to_excel(
             writer, sheet_name="All_Patients", index=False
         )
