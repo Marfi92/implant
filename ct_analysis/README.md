@@ -216,7 +216,22 @@ python 09_build_3mm_cohort.py
 python 07_convert_cohort_to_nifti.py --cohort "Q:\users\marfi\CT_analysis\ct_3mm_cohort.xlsx" --sheet Selected --layout flat --output "W:\SCAPIS_seg_lowres_3mm"
 ```
 
-`--allow-non-contrast` keeps the non-contrast 3 mm series as well; `--min-slices 50` is stricter about coverage.
+`--allow-non-contrast` keeps the non-contrast 3 mm series as well, `--non-contrast-only` keeps only the calcium scoring reconstruction, and `--min-slices 50` is stricter about coverage.
+
+---
+
+### 10. `10_convert_from_7z_archives.py` — recover the series that were never unpacked
+
+The unpacked datahub on `Q:` holds the contrast (`ccta`) batches only, so script 7 reports `folder not found` for every calcium scoring (`casc`) patient. Those batches are still on the share as one archive per batch, for example `V:\datahub\CT-site-1-casc\ct_site_1_casc_11.7z`.
+
+This script takes the cohort rows whose `series_folder` does not exist on disk, groups them by batch, and for each batch extracts only the patient folders it needs into a scratch folder, converts them with the same code as script 7, writes `<patient_id>.nii.gz` into the same output folder, then deletes the extracted DICOM before the next batch. Peak extra disk use is one batch. The archives themselves are never modified. It resumes: volumes that already exist are skipped, and `nifti_index_from_7z.xlsx` is rewritten after every batch.
+
+```bat
+python 10_convert_from_7z_archives.py --cohort "Q:\users\marfi\CT_analysis\ct_3mm_noncontrast.xlsx" --output "W:\SCAPIS_seg_lowres_3mm_noncontrast"
+python 10_convert_from_7z_archives.py --limit 2
+```
+
+`--limit 2` tries two batches first, `--keep` leaves the extracted DICOM in place, and `--seven-zip` points at `7z.exe` when it is not in the usual place.
 
 ---
 
