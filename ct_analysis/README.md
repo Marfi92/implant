@@ -235,6 +235,22 @@ python 10_convert_from_7z_archives.py --limit 2
 
 ---
 
+### 11. `11_fat_hu_features_and_groups.py` — clean the fat masks by HU, measure, compare groups
+
+The nnU-Net fat model outputs the whole pericardial fat compartment, so the mask still contains non-fat voxels. This script keeps only the mask voxels whose CT value lies between `--fat-low` and `--fat-high` (-190 to -30 HU by default), writes the cleaned mask to `<output>\fat_hu_masks\<patient_id>.nii.gz`, and measures 11 features per patient: cleaned and raw fat volume, kept fraction, fat mean/SD/P25/P75 HU, left-atrium volume and mean HU, fat-to-LA ratio, and fat volume per cm of covered heart length.
+
+Groups come from `test80_groups.xlsx` when present, otherwise from the clinical CSV (`AF_CT_Baseline`, `Prev_HF`, `Ischemic_Stroke_IC_Baseline`; `YES`/`NO` coded). `fat_la_features.xlsx` holds `Features` (one row per patient), `Group_Stats` (median, IQR, mean, SD per group), and `Tests` (Mann-Whitney of each group against the controls), plus one box plot per feature under `plots\`.
+
+Input names may be either `<patient_id>_0000.nii.gz` (the nnU-Net input copies) or `<patient_id>.nii.gz`; nothing is renamed and the masks are read where `nnUNetv2_predict` wrote them.
+
+```bat
+python 11_fat_hu_features_and_groups.py
+python 11_fat_hu_features_and_groups.py --fat-low -190 --fat-high -30 --limit 5
+python 11_fat_hu_features_and_groups.py --no-plots
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
