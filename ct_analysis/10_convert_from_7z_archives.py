@@ -156,20 +156,39 @@ def rows_to_retry(args: argparse.Namespace) -> pd.DataFrame:
     return retry
 
 
-def extract_with_py7zr(archive: Path, patients: list[str], scratch: Path) -> None:
-    """Unpack the folders of these patients with the library instead of 7z.exe."""
+def extract_with_py7zr(
+    archive: Path, patients: list[str], scratch: Path, chunk: int = 20
+) -> None:
+    """Unpack the folders of these patients with the library instead of 7z.exe.
+
+    The archive is opened here and the open file is handed to py7zr: that keeps
+    the library on its single threaded path, which otherwise opens one handle
+    per worker and dies with "Too many open files" on a batch of 200 patients.
+    The patients are also done in small groups, so one call never carries
+    thousands of targets.
+    """
     import py7zr
 
     wanted = {patient.lower() for patient in patients}
-    with py7zr.SevenZipFile(archive, mode="r") as handle:
-        targets = [
-            name
-            for name in handle.getnames()
-            if wanted & {part.lower() for part in name.replace("\\", "/").split("/")}
-        ]
-        if not targets:
+    with archive.open("rb") as stream:
+        with py7zr.SevenZipFile(stream, mode="r") as handle:
+            names = handle.getnames()
+        groups: dict[str, list[str]] = {}
+        for name in names:
+            parts = name.replace("\\", "/").split("/")
+            match = wanted & {part.lower() for part in parts}
+            if match:
+                groups.setdefault(next(iter(match)), []).append(name)
+        if not groups:
             raise FileNotFoundError(f"no requested patient inside {archive.name}")
-        handle.extract(path=scratch, targets=targets)
+        found = list(groups)
+        for start in range(0, len(found), chunk):
+            targets = [
+                name for patient in found[start : start + chunk] for name in groups[patient]
+            ]
+            stream.seek(0)
+            with py7zr.SevenZipFile(stream, mode="r") as handle:
+                handle.extract(path=scratch, targets=targets)
 
 
 def extract_patients(
