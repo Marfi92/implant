@@ -231,7 +231,7 @@ python 10_convert_from_7z_archives.py --cohort "Q:\users\marfi\CT_analysis\ct_3m
 python 10_convert_from_7z_archives.py --limit 2
 ```
 
-`--limit 2` tries two batches first, `--keep` leaves the extracted DICOM in place, and `--seven-zip` points at `7z.exe` when it is not in the usual place.
+`--limit 2` tries two batches first, `--keep` leaves the extracted DICOM in place, and `--seven-zip` points at `7z.exe` when it is not in the usual place. Without 7-Zip the archives are read with the `py7zr` package (`pip install py7zr`), which needs no admin rights.
 
 ---
 

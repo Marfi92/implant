@@ -93,17 +93,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_known_args(argv)[0]
 
 
-def find_seven_zip(explicit: Path | None) -> Path:
+def find_seven_zip(explicit: Path | None) -> Path | None:
+    """Path of 7z.exe, or None when the py7zr library is used instead."""
     for candidate in ([explicit] if explicit else []) + SEVEN_ZIP_CANDIDATES:
         if candidate and candidate.exists():
             return candidate
     found = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
     if found:
         return Path(found)
-    raise SystemExit(
-        "7z.exe not found. Install 7-Zip (https://www.7-zip.org) or pass "
-        "--seven-zip C:\\path\\to\\7z.exe"
-    )
+    try:
+        import py7zr  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            "no reader for the archives. Either pip install py7zr, or install "
+            "7-Zip (https://www.7-zip.org) and pass --seven-zip C:\\path\\to\\7z.exe"
+        )
+    return None
 
 
 def batch_of(series_folder: str) -> str:
@@ -151,11 +156,30 @@ def rows_to_retry(args: argparse.Namespace) -> pd.DataFrame:
     return retry
 
 
+def extract_with_py7zr(archive: Path, patients: list[str], scratch: Path) -> None:
+    """Unpack the folders of these patients with the library instead of 7z.exe."""
+    import py7zr
+
+    wanted = {patient.lower() for patient in patients}
+    with py7zr.SevenZipFile(archive, mode="r") as handle:
+        targets = [
+            name
+            for name in handle.getnames()
+            if wanted & {part.lower() for part in name.replace("\\", "/").split("/")}
+        ]
+        if not targets:
+            raise FileNotFoundError(f"no requested patient inside {archive.name}")
+        handle.extract(path=scratch, targets=targets)
+
+
 def extract_patients(
-    seven_zip: Path, archive: Path, patients: list[str], scratch: Path
+    seven_zip: Path | None, archive: Path, patients: list[str], scratch: Path
 ) -> None:
     """Unpack only the folders of these patients out of one archive."""
     scratch.mkdir(parents=True, exist_ok=True)
+    if seven_zip is None:
+        extract_with_py7zr(archive, patients, scratch)
+        return
     command = [
         str(seven_zip),
         "x",
@@ -192,7 +216,7 @@ def main(argv: list[str] | None = None) -> None:
     retry = rows_to_retry(args)
     args.output.mkdir(parents=True, exist_ok=True)
 
-    print(f"7-Zip : {seven_zip}")
+    print(f"Reader: {seven_zip if seven_zip else 'py7zr library'}")
     print(f"{len(retry)} patients to recover from the archives")
     if retry.empty:
         return
@@ -224,7 +248,7 @@ def main(argv: list[str] | None = None) -> None:
             extract_patients(
                 seven_zip, archive, group["patient_id"].tolist(), scratch
             )
-        except subprocess.CalledProcessError as problem:
+        except (subprocess.CalledProcessError, OSError) as problem:
             print(f"    extraction failed: {problem}")
             for record in group.to_dict("records"):
                 rows.append({**record, "status": "failed", "error": str(problem)})
