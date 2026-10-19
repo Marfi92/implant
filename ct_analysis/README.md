@@ -269,6 +269,24 @@ python 12_random_forest_groups.py --apply AF ^
 
 ---
 
+### 13. `13_compare_models.py` — several classifiers side by side, plus combined features
+
+Runs logistic regression (L2 and elastic net), random forest, gradient boosting, an RBF support vector machine and k nearest neighbours over the *same* repeated 5-fold splits, so the AUCs are comparable rather than six separate experiments. Continuous features are standardised inside each fold, so the held-out patients never contribute to the mean and SD.
+
+On top of the measured features it derives combinations, because a raw fat volume largely reports body size: `fat_per_bmi`, `fat_per_la`, `fat_per_year`, `la_per_bmi`, `fat_hu_iqr`, `fat_hu_skew`, `fat_dense_fraction`, `la_to_fat_hu`, `fat_density_ratio`, `fat_volume_z`. Use `--no-derived` to compare against the plain feature set.
+
+`model_comparison.xlsx` has `Performance` (AUC mean and SD per fold, out-of-fold AUC, accuracy, sensitivity, specificity per model and group), `Best`, `Importance` (importances or coefficients of the best model) and `Predictions`; `plots\compare_<group>_auc.png` and `plots\compare_<group>_roc.png` show the same.
+
+With roughly 20 patients per group the per-fold SD is around 0.15, so differences between models of that size mean nothing; the script prints the SD next to each AUC for that reason.
+
+```bat
+python 13_compare_models.py
+python 13_compare_models.py --folds 5 --repeats 10
+python 13_compare_models.py --no-derived --groups AF
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
