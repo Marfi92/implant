@@ -251,6 +251,24 @@ python 11_fat_hu_features_and_groups.py --no-plots
 
 ---
 
+### 12. `12_random_forest_groups.py` — random forest per group on the fat/LA features
+
+Takes the `Features` sheet of script 11, adds age, sex and BMI from the clinical CSV (epicardial fat grows with body size, so the group effect has to survive that), and trains one random forest per group against the controls with repeated stratified cross validation. Reported AUC, sensitivity and specificity are out of fold, so they are not the training fit.
+
+`random_forest.xlsx` has `Performance`, `Importance` (mean importance per feature and group) and `Predictions` (out-of-fold probability per patient); `plots\rf_<group>_roc.png` and `plots\rf_<group>_importance.png` show the same; `models\rf_<group>.joblib` is the forest refit on all patients.
+
+```bat
+python 12_random_forest_groups.py
+python 12_random_forest_groups.py --groups AF --trees 1000 --repeats 20
+
+REM score new patients whose features came out of script 11
+python 12_random_forest_groups.py --apply AF ^
+  --features "Q:\...\new_cases\fat_la_features.xlsx" ^
+  --models "Q:\...\test80_analysis\models"
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
