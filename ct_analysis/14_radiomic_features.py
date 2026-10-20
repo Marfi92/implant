@@ -70,6 +70,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=10.0,
         help="distance from the atrial surface counted as LA-EAT when no mask is given",
     )
+    parser.add_argument(
+        "--exclude-la",
+        action="store_true",
+        help="subtract the atrial cavity from the EAT mask, for masks not cleaned yet",
+    )
+    parser.add_argument("--la-dilate", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_known_args(argv)[0]
@@ -188,6 +194,10 @@ def measure_one(
         if path and path.exists():
             array, _ = helpers.read_array(path)
             arrays[name] = helpers.align(array, volume) > 0
+    if args.exclude_la and "eat" in arrays and "la" in arrays and arrays["la"].any():
+        cavity = helpers.blood_pool(arrays["la"], args.la_dilate)
+        arrays["eat"] = arrays["eat"] & ~cavity
+
     if masks.get("laeat") and masks["laeat"].exists():
         array, _ = helpers.read_array(masks["laeat"])
         arrays["laeat"] = helpers.align(array, volume) > 0

@@ -120,8 +120,16 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def patient_of(name: str) -> str:
-    """VALLA_1234_0000.nii.gz and VALLA_1234.nii.gz both mean VALLA_1234."""
-    stem = name[:-7] if name.endswith(".nii.gz") else Path(name).stem
+    """VALLA_1234_0000.nii.gz, VALLA_1234.nii.nii.gz and VALLA_1234.nii.gz all mean VALLA_1234."""
+    stem = name
+    while True:
+        lowered = stem.lower()
+        for suffix in (".gz", ".nii", ".nrrd", ".mha"):
+            if lowered.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        else:
+            break
     return stem[:-5] if stem.endswith("_0000") else stem
 
 
