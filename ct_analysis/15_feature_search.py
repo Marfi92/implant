@@ -171,7 +171,7 @@ def load_features(args) -> pd.DataFrame:
         if module is not None:
             table, _ = module.add_clinical(table, Path(args.clinical))
         table = add_biomarkers(table, Path(args.clinical), args.biomarkers)
-    return table
+    return table.drop(columns=["sex", "sex_male"], errors="ignore")
 
 
 def add_biomarkers(table: pd.DataFrame, clinical_file: Path, columns: list[str]) -> pd.DataFrame:
