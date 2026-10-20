@@ -122,15 +122,17 @@ def parse_args(argv=None) -> argparse.Namespace:
 def patient_of(name: str) -> str:
     """VALLA_1234_0000.nii.gz, VALLA_1234.nii.nii.gz and VALLA_1234.nii.gz all mean VALLA_1234."""
     stem = name
-    while True:
+    changed = True
+    while changed:
+        changed = False
         lowered = stem.lower()
         for suffix in (".gz", ".nii", ".nrrd", ".mha"):
             if lowered.endswith(suffix):
-                stem = stem[: -len(suffix)]
+                stem, changed = stem[: -len(suffix)], True
                 break
-        else:
-            break
-    return stem[:-5] if stem.endswith("_0000") else stem
+        if not changed and stem.endswith("_0000"):
+            stem, changed = stem[:-5], True
+    return stem
 
 
 def index_folder(folder: Path) -> dict[str, Path]:
