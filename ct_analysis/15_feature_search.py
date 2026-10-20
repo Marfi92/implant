@@ -69,6 +69,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--max-size", type=int, default=4, help="largest combination")
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--holdout", type=float, default=0.0, help="share kept out of the search")
+    parser.add_argument(
+        "--biomarkers",
+        nargs="*",
+        default=[],
+        help="extra clinical CSV columns to merge, e.g. HbA1c and cholesterol",
+    )
     parser.add_argument("--no-clinical", action="store_true")
     parser.add_argument("--no-composite", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
@@ -164,7 +170,30 @@ def load_features(args) -> pd.DataFrame:
                     break
         if module is not None:
             table, _ = module.add_clinical(table, Path(args.clinical))
+        table = add_biomarkers(table, Path(args.clinical), args.biomarkers)
     return table
+
+
+def add_biomarkers(table: pd.DataFrame, clinical_file: Path, columns: list[str]) -> pd.DataFrame:
+    """Merge named clinical columns, HbA1c and the lipids, as numeric features."""
+    if not columns or not clinical_file.exists():
+        return table
+    clinical = pd.read_csv(clinical_file, sep=None, engine="python", dtype=str)
+    if "Subject" not in clinical:
+        return table
+    present = [name for name in columns if name in clinical.columns]
+    missing = [name for name in columns if name not in clinical.columns]
+    if missing:
+        print(f"biomarkers not in the CSV: {', '.join(missing)}")
+    if not present:
+        return table
+    block = clinical[["Subject"] + present].rename(columns={"Subject": "patient_id"})
+    block["patient_id"] = block["patient_id"].astype(str)
+    for name in present:
+        block[name] = pd.to_numeric(
+            block[name].astype(str).str.replace(",", ".", regex=False), errors="coerce"
+        )
+    return table.merge(block, on="patient_id", how="left")
 
 
 def usable_columns(table: pd.DataFrame) -> list[str]:
