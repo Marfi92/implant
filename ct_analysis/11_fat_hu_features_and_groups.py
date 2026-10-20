@@ -5,6 +5,14 @@ still holds voxels that are not fat. Only voxels of the CT image between
 --fat-low and --fat-high HU (-190 to -30 by default) are kept, the cleaned mask
 is written to its own folder, and the measurements are taken from that mask.
 
+After the HU window, voxels that lie inside the left atrium are dropped, because
+non-contrast blood and the HU window overlap and the atrial cavity otherwise
+leaks into the fat mask. The LA mask is hole filled (in 3D and slice by slice)
+and grown by --la-dilate voxels first, so the atrial wall goes with it. One
+voxel is the default: epicardial fat sits directly on the atrial wall, so a
+larger dilation starts eating real fat (--la-dilate 0 subtracts the cavity
+only). Use --keep-la-inside to switch the subtraction off.
+
 Per patient 10 features are measured:
 
     fat_volume_ml          cleaned fat volume
@@ -15,6 +23,7 @@ Per patient 10 features are measured:
     fat_p25_hu             lower HU quartile
     fat_p75_hu             upper HU quartile
     la_volume_ml           left atrium volume
+    fat_in_la_removed_ml   fat volume that fell inside the atrium and was dropped
     la_mean_hu             mean HU inside the atrium (contrast/blood signal)
     fat_to_la_ratio        fat volume / atrium volume
     fat_index_ml_per_m     fat volume per cm of covered heart length (extra)
@@ -36,6 +45,8 @@ Output: <output>\\fat_hu_masks\\<patient_id>.nii.gz   cleaned masks
 Usage
     python 11_fat_hu_features_and_groups.py
     python 11_fat_hu_features_and_groups.py --fat-low -190 --fat-high -30
+    python 11_fat_hu_features_and_groups.py --la-dilate 3
+    python 11_fat_hu_features_and_groups.py --keep-la-inside
     python 11_fat_hu_features_and_groups.py --no-plots
 
 In a Jupyter cell:
@@ -78,6 +89,7 @@ FEATURES = [
     "la_mean_hu",
     "fat_to_la_ratio",
     "fat_index_ml_per_cm",
+    "fat_in_la_removed_ml",
 ]
 
 
@@ -91,6 +103,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--fat-low", type=float, default=-190.0)
     parser.add_argument("--fat-high", type=float, default=-30.0)
+    parser.add_argument(
+        "--keep-la-inside",
+        action="store_true",
+        help="keep voxels inside the left atrium instead of dropping them",
+    )
+    parser.add_argument(
+        "--la-dilate",
+        type=int,
+        default=1,
+        help="grow the atrium mask by this many voxels before subtracting it",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_known_args(argv)[0]
@@ -136,6 +159,18 @@ def hu_stats(values: np.ndarray) -> dict[str, float]:
     }
 
 
+def blood_pool(atrium: np.ndarray, dilate: int) -> np.ndarray:
+    """The atrial cavity: holes filled in 3D and per slice, then grown to take the wall."""
+    from scipy.ndimage import binary_dilation, binary_fill_holes
+
+    filled = binary_fill_holes(atrium)
+    for index in range(filled.shape[0]):
+        filled[index] = binary_fill_holes(filled[index])
+    if dilate > 0:
+        filled = binary_dilation(filled, iterations=dilate)
+    return filled
+
+
 def measure_one(
     image_path: Path,
     fat_path: Path,
@@ -143,6 +178,8 @@ def measure_one(
     low: float,
     high: float,
     cleaned_target: Path,
+    exclude_la: bool = True,
+    la_dilate: int = 1,
 ) -> dict[str, object]:
     """HU window on the fat mask, write the cleaned mask, return the features."""
     volume, image = read_array(image_path)
@@ -151,6 +188,16 @@ def measure_one(
 
     inside_window = (volume >= low) & (volume <= high)
     fat = fat_raw & inside_window
+
+    atrium = None
+    removed_voxels = 0
+    if la_path and la_path.exists():
+        atrium, _ = read_array(la_path)
+        atrium = align(atrium, volume) > 0
+        if exclude_la and atrium.any():
+            cavity = blood_pool(atrium, la_dilate)
+            removed_voxels = int((fat & cavity).sum())
+            fat = fat & ~cavity
 
     cleaned = sitk.GetImageFromArray(fat.astype(np.uint8))
     cleaned.CopyInformation(fat_image)
@@ -174,6 +221,7 @@ def measure_one(
         "la_volume_ml": float("nan"),
         "la_mean_hu": float("nan"),
         "fat_to_la_ratio": float("nan"),
+        "fat_in_la_removed_ml": round(removed_voxels * millilitre, 2),
         "voxel_ml": round(millilitre, 5),
         "slice_mm": round(float(image.GetSpacing()[2]), 2),
         "cleaned_mask": str(cleaned_target),
@@ -186,9 +234,7 @@ def measure_one(
     else:
         row["fat_index_ml_per_cm"] = float("nan")
 
-    if la_path and la_path.exists():
-        atrium, _ = read_array(la_path)
-        atrium = align(atrium, volume) > 0
+    if atrium is not None:
         la_ml = float(atrium.sum()) * millilitre
         row["la_volume_ml"] = round(la_ml, 2)
         row["la_mean_hu"] = round(hu_stats(volume[atrium])["mean"], 1)
@@ -331,6 +377,8 @@ def main(argv=None) -> None:
                 args.fat_low,
                 args.fat_high,
                 target,
+                exclude_la=not args.keep_la_inside,
+                la_dilate=args.la_dilate,
             )
             row["status"] = "ok"
             row["error"] = ""

@@ -287,6 +287,45 @@ python 13_compare_models.py --no-derived --groups AF
 
 ---
 
+### 14. `14_radiomic_features.py` — PyRadiomics features per compartment
+
+Features for the left atrium, the LA-EAT and the whole-heart EAT, extracted with PyRadiomics so the definitions are the standard (IBSI) ones: first order `Mean`, `StandardDeviation`, `Skewness`, `Kurtosis`, `Entropy`, and GLSZM `SmallAreaEmphasis`, `LargeAreaEmphasis`, `GrayLevelNonUniformity`, `SizeZoneNonUniformity`, `ZonePercentage`, `ZoneEntropy`. Volumes in millilitres come from the voxel count. No HU window is applied here; the EAT masks are expected to be the cleaned ones with the atrial blood pool already removed (`fat_hu_masks_noLA`).
+
+If no LA-EAT mask folder is passed, LA-EAT is derived as the EAT sitting within `--la-eat-mm` (10 mm by default) of the atrial surface, measured by a distance transform in real millimetres. Grey levels are binned by `--bin-width` HU (25 by default), the PyRadiomics default style of fixed bin width rather than a fixed count.
+
+Composite indices `cmi1 = W * L` and `cmi2 = W**2 * L**0.1 * E**3` of whole-heart EAT (W), LA volume (L) and LA-EAT (E) are written alongside; script 15 re-optimises those exponents.
+
+Output: `radiomic_features.xlsx` with `Features`, `Group_Stats` and `Tests`, and box plots in `plots_radiomic`.
+
+```bat
+pip install pyradiomics
+python 14_radiomic_features.py
+python 14_radiomic_features.py --la-eat-masks "Q:\...\test80_seg_laeat"
+python 14_radiomic_features.py --bin-width 25 --la-eat-mm 10
+```
+
+---
+
+### 15. `15_feature_search.py` — composite exponents and the 1-4 feature search
+
+Reads the sheet from script 14 (merged with script 11 and with age, sex and BMI) and, per group against the controls:
+
+1. searches the exponents of `W**a * L**b * E**c` on a grid, scoring each candidate by the cross-validated AUC of that single index, and keeps the best as `cmi_opt` next to the published `cmi1` and `cmi2`;
+2. ranks every feature by univariate cross-validated AUC and carries the top `--pool` forward, since all 1-4 combinations of 50 features is far beyond what 40 patients support;
+3. trains every combination of 1, 2, 3 and 4 of that pool with logistic regression, random forest, SVM-RBF and linear discriminant analysis, each a pipeline of median imputation and z-scoring, under the same stratified 5-fold cross validation repeated `--repeats` times.
+
+Two things to keep in mind when reading the table: the best of a few thousand combinations is optimistic by construction, and the exponent grid is scored on the same splits as everything else. `--holdout 0.25` keeps a quarter of the patients out of the entire search and reports `auc_holdout` for the top rows, which is the honest number.
+
+Output: `feature_search.xlsx` with `Best_Models`, `Top_Combinations`, `Composite` and `Univariate`, and `plots\search_<group>.png`.
+
+```bat
+python 15_feature_search.py
+python 15_feature_search.py --pool 10 --max-size 4 --repeats 3
+python 15_feature_search.py --holdout 0.25 --groups AF
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
