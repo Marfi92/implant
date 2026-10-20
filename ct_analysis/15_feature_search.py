@@ -328,9 +328,13 @@ def search_group(group: str, table: pd.DataFrame, columns: list[str], args) -> d
             )
         return out
 
-    batches = Parallel(n_jobs=args.jobs, prefer="processes")(
-        delayed(score_one)(names) for names in wanted
-    )
+    try:
+        batches = Parallel(n_jobs=args.jobs, prefer="processes")(
+            delayed(score_one)(names) for names in wanted
+        )
+    except Exception as error:  # noqa: BLE001 - any worker death falls back to one process
+        print(f"parallel search failed ({type(error).__name__}), running in one process")
+        batches = [score_one(names) for names in wanted]
     results = pd.DataFrame([row for batch in batches for row in batch]).sort_values(
         "auc", ascending=False
     )
