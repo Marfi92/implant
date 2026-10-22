@@ -1,12 +1,13 @@
-# DINOv2 + LoRA for cardiac CT: left atrium and epicardial fat in one model.
+# DINOv2 + LoRA for cardiac CT: left atrium or epicardial fat, nnU-Net folder layout.
 # Same design as the MRI script (LoRA in every DINOv2 block, 3D decoder over a stack
 # of slices, CNN skips, edge weighted loss), changed for CT:
 #   1. HU windowing instead of percentile scaling, so the intensities mean the same
 #      thing in every scan: fat near -100 HU, blood near 100 HU after contrast.
-#   2. Three classes: background, LA, EAT.
-#   3. Crop box from LA and fat together, and no largest component cleanup on fat,
-#      which is diffuse and never one blob.
-# Labels may be one file per case with LA = 1 and fat = 2, or two folders of binary masks.
+#   2. Trains on imagesTr/labelsTr and reports Dice on imagesTs/labelsTs, the same
+#      test cases as nnU-Net, so the two Dice tables are directly comparable.
+#   3. No largest component cleanup on fat, which is diffuse and never one blob.
+# CLASSES must match the label values in labelsTr: ['LA'] or ['EAT'] for a one class
+# dataset, ['LA', 'EAT'] if one label file holds LA = 1 and fat = 2.
 # Jupyter: %run 16_dinov2_lora_ct_la_fat.py      Only predict: MODE = 'predict'
 import os
 import random
@@ -21,34 +22,48 @@ from scipy import ndimage
 from torch import nn
 
 # ---------------- settings ----------------
-BASE = r"Q:\users\marfi\Automatic segmentations\finalllll\final"
-IMG_DIR = BASE + r"\test80"  # CT volumes, <case>_0000.nii.gz or <case>.nii.gz
-LAB_DIR = ""  # one label file per case, LA = 1 and fat = 2; leave empty to use the two folders below
-LA_LAB_DIR = BASE + r"\test80_seg_la"  # manual LA masks
-FAT_LAB_DIR = BASE + r"\test80_seg_fat"  # manual fat masks
-OUT = BASE + r"\dinov2_ct_la_fat"
+DATASET = r"Q:\users\marfi\Automatic segmentations\finalllll\final\LA82"
+TRAIN_IMG_DIR = DATASET + r"\imagesTr"
+TRAIN_LAB_DIR = DATASET + r"\labelsTr"
+TEST_IMG_DIR = DATASET + r"\imagesTs"
+TEST_LAB_DIR = DATASET + r"\labelsTs"
+OUT = DATASET + r"\dinov2_lora"
 BACKBONE = "dinov2_vits14"
 SIZE = 448
-CLASSES = ["LA", "EAT"]
+CLASSES = ["LA"]  # label value 1 is LA; use ['EAT'] for the fat dataset
 NCLS = len(CLASSES) + 1
 HU_WINDOW = (-200.0, 400.0)  # fat, muscle and contrast filled atrium all inside
 DEPTH = 8  # slices per 3D stack (GPU out of memory: 6)
 LORA_R, LORA_A = 8, 16
 EPOCHS = 30
 LR, LR_LORA = 1e-3, 3e-4
-CLS_W = [1.0, 1.0, 2.0]  # loss weight background, LA, EAT
+CLS_W = [1.0] + [2.0 if name == "EAT" else 1.0 for name in CLASSES]  # loss weight per class
 EDGE_W = 2.0
 PAD_MM = 15
 ZPAD = 3
-VAL_SHARE = 0.25  # cases kept out of training
 MODE = "all"  # 'train', 'predict' or 'all'
 QUICK = False  # True = 5 cases, 2 epochs, to test the script
-PRED_TRAIN = True
+PRED_TRAIN = False  # also predict the training cases
 REFINE = 1
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def use_dataset(folder: str, classes: list) -> None:
+    """Point the script at an nnU-Net dataset folder, e.g. use_dataset(BASE + r'\\FAT82', ['EAT'])."""
+    global TRAIN_IMG_DIR, TRAIN_LAB_DIR, TEST_IMG_DIR, TEST_LAB_DIR, OUT, CLASSES
+    TRAIN_IMG_DIR = os.path.join(folder, "imagesTr")
+    TRAIN_LAB_DIR = os.path.join(folder, "labelsTr")
+    TEST_IMG_DIR = os.path.join(folder, "imagesTs")
+    TEST_LAB_DIR = os.path.join(folder, "labelsTs")
+    OUT = os.path.join(folder, "dinov2_lora")
+    CLASSES = classes
+
+
 def set_up() -> None:
+    """Make the output folder, fix the seeds and follow CLASSES if it was changed."""
+    global NCLS, CLS_W
+    NCLS = len(CLASSES) + 1
+    CLS_W = [1.0] + [2.0 if name == "EAT" else 1.0 for name in CLASSES]
     os.makedirs(OUT, exist_ok=True)
     torch.manual_seed(0)
     np.random.seed(0)
@@ -80,23 +95,17 @@ def index_folder(folder: str) -> dict:
     return found
 
 
-def case_lists() -> tuple[list, dict, dict, dict]:
-    """Cases with an image and labels, split into training and validation."""
-    images = index_folder(IMG_DIR)
-    single = index_folder(LAB_DIR)
-    la_labels = index_folder(LA_LAB_DIR)
-    fat_labels = index_folder(FAT_LAB_DIR)
-    if single:
-        cases = sorted(set(images) & set(single))
-    else:
-        cases = sorted(set(images) & set(la_labels) & set(fat_labels))
-    if not cases:
-        raise SystemExit("no case has both an image and labels, check the folders at the top")
-    cut = max(1, round(len(cases) * VAL_SHARE))
-    rng = random.Random(0)
-    shuffled = cases[:]
-    rng.shuffle(shuffled)
-    return [shuffled[cut:], shuffled[:cut]], images, single, {"LA": la_labels, "EAT": fat_labels}
+def case_lists() -> tuple[list, list, dict, dict]:
+    """Training cases from imagesTr/labelsTr and test cases from imagesTs/labelsTs."""
+    images = index_folder(TRAIN_IMG_DIR) | index_folder(TEST_IMG_DIR)
+    labels = index_folder(TRAIN_LAB_DIR) | index_folder(TEST_LAB_DIR)
+    train_cases = sorted(set(index_folder(TRAIN_IMG_DIR)) & set(index_folder(TRAIN_LAB_DIR)))
+    test_cases = sorted(set(index_folder(TEST_IMG_DIR)) & set(index_folder(TEST_LAB_DIR)))
+    if not train_cases and MODE != "predict":
+        raise SystemExit("no training case has both an image and a label, check the folders")
+    if not test_cases:
+        print("no test case found, Dice will only be reported on the training cases")
+    return [train_cases, test_cases], images, labels
 
 
 def load_image(path: str):
@@ -108,20 +117,13 @@ def load_image(path: str):
     return volume, nii
 
 
-def load_label(cid: str, shape, single: dict, pairs: dict) -> np.ndarray:
-    """Label volume with LA = 1 and fat = 2, from one file or from two binary masks."""
-    if cid in single:
-        label = np.asarray(nib.load(single[cid]).dataobj).astype(np.int64)
-        label[label > len(CLASSES)] = 0
-        return label
-    label = np.zeros(shape, np.int64)
-    for value, name in enumerate(CLASSES, 1):
-        path = pairs[name].get(cid)
-        if path is None:
-            continue
-        mask = np.asarray(nib.load(path).dataobj) > 0
-        if mask.shape == shape:
-            label[mask] = value
+def load_label(cid: str, shape, labels: dict) -> np.ndarray:
+    """Label volume, class values 1..len(CLASSES), anything above that treated as background."""
+    path = labels.get(cid)
+    if path is None:
+        return np.zeros(shape, np.int64)
+    label = np.asarray(nib.load(path).dataobj).astype(np.int64)
+    label[label > len(CLASSES)] = 0
     return label
 
 
@@ -266,11 +268,11 @@ class DinoSeg3D(nn.Module):
 class Stacks(torch.utils.data.Dataset):
     """Stacks of DEPTH slices, cropped around the heart with random shift and zoom."""
 
-    def __init__(self, cases, images, single, pairs):
+    def __init__(self, cases, images, labels):
         self.vols, self.items = [], []
         for cid in cases:
             volume, nii = load_image(images[cid])
-            label = load_label(cid, volume.shape, single, pairs)
+            label = load_label(cid, volume.shape, labels)
             box = roi_box(label >= 1, nii.header.get_zooms()[:3])
             if box is None:
                 continue
@@ -325,8 +327,8 @@ def edge_ce(logit, y, weight):
 
 
 # ---------------- train ----------------
-def train(cases, images, single, pairs):
-    dataset = Stacks(cases[:5] if QUICK else cases, images, single, pairs)
+def train(cases, images, labels):
+    dataset = Stacks(cases[:5] if QUICK else cases, images, labels)
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=True
     )
@@ -416,17 +418,17 @@ def dice(a, b):
     return np.nan if total == 0 else 2 * np.logical_and(a, b).sum() / total
 
 
-def predict(model, splits, images, single, pairs):
+def predict(model, splits, images, labels):
     model.eval()
     rows = []
-    groups = [("validation", splits[1])] + ([("train", splits[0])] if PRED_TRAIN else [])
+    groups = [("test", splits[1])] + ([("train", splits[0])] if PRED_TRAIN else [])
     for name, cases in groups:
         folder = os.path.join(OUT, name)
         os.makedirs(folder, exist_ok=True)
         for cid in cases[:2] if QUICK else cases:
             volume, nii = load_image(images[cid])
             spacing = nii.header.get_zooms()[:3]
-            label = load_label(cid, volume.shape, single, pairs)
+            label = load_label(cid, volume.shape, labels)
             box = roi_box(label >= 1, spacing)
             if box is None:
                 first = predict_case(model, volume, None).argmax(0)
@@ -437,8 +439,9 @@ def predict(model, splits, images, single, pairs):
                 refined = roi_box(predicted >= 1, spacing)
                 if refined is not None:
                     predicted = predict_case(model, volume, refined).argmax(0).astype(np.uint8)
-            atrium = predicted == 1
-            predicted[atrium & ~largest_cc(atrium)] = 0  # the atrium is one blob, the fat is not
+            if "LA" in CLASSES:  # the atrium is one blob, the fat is not
+                atrium = predicted == CLASSES.index("LA") + 1
+                predicted[atrium & ~largest_cc(atrium)] = 0
             nib.save(
                 nib.Nifti1Image(predicted, nii.affine, nii.header),
                 os.path.join(folder, cid + ".nii.gz"),
@@ -457,18 +460,16 @@ def predict(model, splits, images, single, pairs):
 
 def main():
     set_up()
-    print("device", DEV)
-    splits, images, single, pairs = case_lists()
-    print(f"{len(splits[0])} training cases, {len(splits[1])} validation cases")
+    print("device", DEV, "classes", CLASSES)
+    splits, images, labels = case_lists()
+    print(f"{len(splits[0])} training cases, {len(splits[1])} test cases")
     if MODE in ("train", "all"):
-        model = train(splits[0], images, single, pairs)
+        model = train(splits[0], images, labels)
     else:
         model = DinoSeg3D().to(DEV)
-        model.load_state_dict(
-            torch.load(os.path.join(OUT, "dinov2_ct.pt"), map_location=DEV)
-        )
+        model.load_state_dict(torch.load(os.path.join(OUT, "dinov2_ct.pt"), map_location=DEV))
     if MODE in ("predict", "all"):
-        predict(model, splits, images, single, pairs)
+        predict(model, splits, images, labels)
 
 
 if __name__ == "__main__":
