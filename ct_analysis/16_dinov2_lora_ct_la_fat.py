@@ -1,10 +1,10 @@
-# DINOv2 + LoRA for cardiac CT: left atrium or epicardial fat, nnU-Net folder layout.
+# DINOv2 + LoRA for cardiac CT: left atrium or epicardial fat, PoinUNet folder layout.
 # Same design as the MRI script (LoRA in every DINOv2 block, 3D decoder over a stack
 # of slices, CNN skips, edge weighted loss), changed for CT:
 #   1. HU windowing instead of percentile scaling, so the intensities mean the same
 #      thing in every scan: fat near -100 HU, blood near 100 HU after contrast.
 #   2. Trains on imagesTr/labelsTr and reports Dice on imagesTs/labelsTs, the same
-#      test cases as nnU-Net, so the two Dice tables are directly comparable.
+#      test cases as PoinUNet, so the two Dice tables are directly comparable.
 #   3. No largest component cleanup on fat, which is diffuse and never one blob.
 # CLASSES must match the label values in labelsTr: ['LA'] or ['EAT'] for a one class
 # dataset, ['LA', 'EAT'] if one label file holds LA = 1 and fat = 2.
@@ -42,6 +42,8 @@ EDGE_W = 2.0
 PAD_MM = 15
 ZPAD = 3
 MODE = "all"  # 'train', 'predict' or 'all'
+PRED_OUT = ""  # where the predicted masks go, empty = OUT
+CKPT = ""  # trained weights to load in predict mode, empty = OUT\dinov2_ct.pt
 QUICK = False  # True = 5 cases, 2 epochs, to test the script
 PRED_TRAIN = False  # also predict the training cases
 REFINE = 1
@@ -49,7 +51,7 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def use_dataset(folder: str, classes: list) -> None:
-    """Point the script at an nnU-Net dataset folder, e.g. use_dataset(BASE + r'\\FAT82', ['EAT'])."""
+    """Point the script at a dataset folder, e.g. use_dataset(BASE + r'\\FAT82', ['EAT'])."""
     global TRAIN_IMG_DIR, TRAIN_LAB_DIR, TEST_IMG_DIR, TEST_LAB_DIR, OUT, CLASSES
     TRAIN_IMG_DIR = os.path.join(folder, "imagesTr")
     TRAIN_LAB_DIR = os.path.join(folder, "labelsTr")
@@ -59,12 +61,40 @@ def use_dataset(folder: str, classes: list) -> None:
     CLASSES = classes
 
 
+def use_new_images(image_folder: str, out_folder: str, weights_from: str = "") -> None:
+    """Segment a folder of unlabelled scans with an already trained model.
+
+    use_new_images(BASE + r'\\test80', BASE + r'\\test80\\LA_dinov2', BASE + r'\\LA82')
+    """
+    global TEST_IMG_DIR, TEST_LAB_DIR, PRED_OUT, CKPT, MODE
+    TEST_IMG_DIR = image_folder
+    if not index_folder(image_folder):  # scans one level down, e.g. test80\imagesTs
+        for sub in ("imagesTs", "imagesTr", "images", "nifti"):
+            if index_folder(os.path.join(image_folder, sub)):
+                TEST_IMG_DIR = os.path.join(image_folder, sub)
+                break
+    TEST_LAB_DIR = ""
+    PRED_OUT = out_folder
+    if weights_from:
+        CKPT = os.path.join(weights_from, "dinov2_lora", "dinov2_ct.pt")
+    MODE = "predict"
+
+
+def pred_folder() -> str:
+    return PRED_OUT or OUT
+
+
+def ckpt_file() -> str:
+    return CKPT or os.path.join(OUT, "dinov2_ct.pt")
+
+
 def set_up() -> None:
     """Make the output folder, fix the seeds and follow CLASSES if it was changed."""
     global NCLS, CLS_W
     NCLS = len(CLASSES) + 1
     CLS_W = [1.0] + [2.0 if name == "EAT" else 1.0 for name in CLASSES]
     os.makedirs(OUT, exist_ok=True)
+    os.makedirs(pred_folder(), exist_ok=True)
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
@@ -100,7 +130,12 @@ def case_lists() -> tuple[list, list, dict, dict]:
     images = index_folder(TRAIN_IMG_DIR) | index_folder(TEST_IMG_DIR)
     labels = index_folder(TRAIN_LAB_DIR) | index_folder(TEST_LAB_DIR)
     train_cases = sorted(set(index_folder(TRAIN_IMG_DIR)) & set(index_folder(TRAIN_LAB_DIR)))
-    test_cases = sorted(set(index_folder(TEST_IMG_DIR)) & set(index_folder(TEST_LAB_DIR)))
+    test_images = index_folder(TEST_IMG_DIR)
+    test_labels = index_folder(TEST_LAB_DIR)
+    if MODE == "predict" and not test_labels:  # new scans, no manual labels, no Dice
+        test_cases = sorted(test_images)
+    else:
+        test_cases = sorted(set(test_images) & set(test_labels))
     if not train_cases and MODE != "predict":
         raise SystemExit("no training case has both an image and a label, check the folders")
     if not test_cases:
@@ -423,7 +458,7 @@ def predict(model, splits, images, labels):
     rows = []
     groups = [("test", splits[1])] + ([("train", splits[0])] if PRED_TRAIN else [])
     for name, cases in groups:
-        folder = os.path.join(OUT, name)
+        folder = os.path.join(pred_folder(), name)
         os.makedirs(folder, exist_ok=True)
         for cid in cases[:2] if QUICK else cases:
             volume, nii = load_image(images[cid])
@@ -446,6 +481,9 @@ def predict(model, splits, images, labels):
                 nib.Nifti1Image(predicted, nii.affine, nii.header),
                 os.path.join(folder, cid + ".nii.gz"),
             )
+            if not label.any():  # no manual label for this scan, mask only
+                print(name, cid, "mask saved, no label so no Dice")
+                continue
             row = {"group": name, "case": cid}
             for value, class_name in enumerate(CLASSES, 1):
                 row[class_name] = dice(predicted == value, label == value)
@@ -453,9 +491,9 @@ def predict(model, splits, images, labels):
             print(name, cid, " ".join(f"{k} {row[k]:.3f}" for k in CLASSES))
     if rows:
         table = pd.DataFrame(rows)
-        table.to_csv(os.path.join(OUT, "dice_dinov2_ct.csv"), index=False)
+        table.to_csv(os.path.join(pred_folder(), "dice_dinov2_ct.csv"), index=False)
         print("\nMEAN Dice per group\n", table.groupby("group")[CLASSES].mean().round(3))
-    print("saved in", OUT)
+    print("saved in", pred_folder())
 
 
 def main():
@@ -467,7 +505,7 @@ def main():
         model = train(splits[0], images, labels)
     else:
         model = DinoSeg3D().to(DEV)
-        model.load_state_dict(torch.load(os.path.join(OUT, "dinov2_ct.pt"), map_location=DEV))
+        model.load_state_dict(torch.load(ckpt_file(), map_location=DEV))
     if MODE in ("predict", "all"):
         predict(model, splits, images, labels)
 
