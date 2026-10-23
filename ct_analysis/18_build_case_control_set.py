@@ -19,17 +19,21 @@ Only patients that actually have a converted volume are used; patients with a
 diagnosis but no volume are listed in Missing_Volume so nothing is silently lost.
 
 Input : the clinical CSV
-        the NIfTI folder of the non-contrast cohort (<patient_id>.nii.gz or
-        <patient_id>_0000.nii.gz)
-Output: <output>\\case_control_set.xlsx
+        W:\\SCAPIS_seg_lowres_3mm_noncontrast, the NIfTI folder of the non-contrast
+        cohort (<patient_id>.nii.gz or <patient_id>_0000.nii.gz)
+Output: everything under W:\\SCAPIS_seg_lowres_3mm_noncontrast\\analysis
+        <output>\\case_control_set.xlsx
             Summary          counts per step and per group
             Groups           patient_id, group, diagnoses, sex, age, bmi, source file
             Overlaps         how many patients carry each combination of diagnoses
             Matching         which control was matched to which case
             Missing_Volume   diagnosed patients without a converted volume
-        <test folder>\\<patient_id>.nii.gz           copies of the selected scans
-        <test folder>\\test80_groups.xlsx            patient_id and group, read by
-                                                     scripts 11, 14 and 15
+        analysis\\test_AF_HF_stroke_control\\<patient_id>_0000.nii.gz
+                                        copies of the selected scans, named as
+                                        nnU-Net/PoinUNet expects (--plain-names
+                                        drops the _0000)
+        <test folder>\\test80_groups.xlsx  patient_id and group, read by scripts
+                                        11, 14 and 15
 
 Usage
     python 18_build_case_control_set.py
@@ -40,7 +44,7 @@ Usage
 In a Jupyter cell:
     from importlib import import_module
     m = import_module("18_build_case_control_set")
-    m.main(["--images", r"W:\\SCAPIS_seg_lowres_3mm_noncontrast"])
+    m.main(["--controls-per-case", "1"])
 """
 
 from __future__ import annotations
@@ -51,8 +55,9 @@ from pathlib import Path
 
 import pandas as pd
 
-BASE = Path(r"Q:\users\marfi\Automatic segmentations\finalllll\final")
 IMAGES = Path(r"W:\SCAPIS_seg_lowres_3mm_noncontrast")
+ANALYSIS = IMAGES / "analysis"
+TEST_FOLDER = ANALYSIS / "test_AF_HF_stroke_control"
 CLINICAL = Path(r"Q:\users\marfi\CT_analysis\SCAPIS1-DATA-PETITION-1110-20260407(in).csv")
 GROUP_COLUMNS = {
     "AF": "AF_CT_Baseline",
@@ -66,8 +71,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images", type=Path, default=IMAGES)
     parser.add_argument("--clinical", type=Path, default=CLINICAL)
-    parser.add_argument("--test-folder", type=Path, default=BASE / "test_all")
-    parser.add_argument("--output", type=Path, default=BASE / "test_all_analysis")
+    parser.add_argument("--test-folder", type=Path, default=TEST_FOLDER)
+    parser.add_argument("--output", type=Path, default=ANALYSIS)
+    parser.add_argument(
+        "--plain-names",
+        action="store_true",
+        help="copy as <patient_id>.nii.gz instead of the nnU-Net <patient_id>_0000.nii.gz",
+    )
     parser.add_argument(
         "--priority",
         default="AF,HF,stroke",
@@ -226,12 +236,12 @@ def _both(case, control, field) -> bool:
     return pd.notna(case[field]) and pd.notna(control[field])
 
 
-def copy_volumes(selected: pd.DataFrame, folder: Path) -> list[str]:
+def copy_volumes(selected: pd.DataFrame, folder: Path, suffix: str) -> list[str]:
     """Copy one volume per selected patient into the test folder."""
     folder.mkdir(parents=True, exist_ok=True)
     failed = []
     for _, row in selected.iterrows():
-        target = folder / (row["patient_id"] + ".nii.gz")
+        target = folder / (row["patient_id"] + suffix + ".nii.gz")
         if target.exists():
             continue
         try:
@@ -276,7 +286,8 @@ def main(argv=None) -> None:
     ]
     selected = selected[columns]
 
-    failed = [] if args.no_copy else copy_volumes(selected, args.test_folder)
+    suffix = "" if args.plain_names else "_0000"
+    failed = [] if args.no_copy else copy_volumes(selected, args.test_folder, suffix)
     if not args.no_copy:
         args.test_folder.mkdir(parents=True, exist_ok=True)
         selected[["patient_id", "group", "diagnoses"]].to_excel(

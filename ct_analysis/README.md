@@ -332,7 +332,7 @@ Takes the whole 3 mm non-contrast cohort instead of the 20-per-group pilot: ever
 
 Because a patient can carry several diagnoses, two columns are written: `group` (one label, by the priority AF, HF, stroke) for the group comparisons, and `diagnoses` (`AF+HF`, `AF+HF+stroke`, ...) so the overlap is never hidden. The `Overlaps` sheet counts each combination and each pair, which is the table to report before any comparison.
 
-The selected volumes are copied into one test folder together with `test80_groups.xlsx`, the file scripts 11, 14 and 15 read, so the rest of the chain runs unchanged. `--no-copy` writes the workbook only when disk space is short.
+The selected volumes are copied into `W:\SCAPIS_seg_lowres_3mm_noncontrast\analysis\test_AF_HF_stroke_control` as `<patient_id>_0000.nii.gz`, the name nnU-Net/PoinUNet expects (`--plain-names` drops the `_0000`), together with `test80_groups.xlsx`, the file scripts 11, 14 and 15 read, so the rest of the chain runs unchanged. `--no-copy` writes the workbook only when disk space is short.
 
 Output: `case_control_set.xlsx` with `Summary`, `Groups`, `Overlaps`, `Matching` and `Missing_Volume` (diagnosed patients without a volume).
 
