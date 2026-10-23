@@ -326,6 +326,24 @@ python 15_feature_search.py --holdout 0.25 --groups AF
 
 ---
 
+### 18. `18_build_case_control_set.py` — every AF, HF and stroke patient plus matched controls
+
+Takes the whole 3 mm non-contrast cohort instead of the 20-per-group pilot: every patient whose clinical record says AF, heart failure or ischaemic stroke and who has a converted volume, plus the same number of controls matched on sex, age and BMI (`--controls-per-case 2` for two per case).
+
+Because a patient can carry several diagnoses, two columns are written: `group` (one label, by the priority AF, HF, stroke) for the group comparisons, and `diagnoses` (`AF+HF`, `AF+HF+stroke`, ...) so the overlap is never hidden. The `Overlaps` sheet counts each combination and each pair, which is the table to report before any comparison.
+
+The selected volumes are copied into one test folder together with `test80_groups.xlsx`, the file scripts 11, 14 and 15 read, so the rest of the chain runs unchanged. `--no-copy` writes the workbook only when disk space is short.
+
+Output: `case_control_set.xlsx` with `Summary`, `Groups`, `Overlaps`, `Matching` and `Missing_Volume` (diagnosed patients without a volume).
+
+```bat
+python 18_build_case_control_set.py
+python 18_build_case_control_set.py --controls-per-case 2 --age-tolerance 3
+python 18_build_case_control_set.py --no-copy
+```
+
+---
+
 ## Workflow
 
 1. For the complete extracted datahub, run Script 4 to create the resumable raw database, per-site workbooks, and master 3D/4D index. If a site has no workbook afterwards, run Script 5 to see whether that folder still holds archives or contains no DICOM headers.
