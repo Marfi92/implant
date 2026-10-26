@@ -64,6 +64,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import mannwhitneyu
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
@@ -81,6 +82,8 @@ from sklearn.svm import SVC
 ANALYSIS = Path(r"W:\SCAPIS_seg_lowres_3mm_noncontrast\analysis\results")
 COMPARTMENTS = {"la": "LA", "laeat": "LA-EAT", "eat": "whole EAT"}
 MODELS = ("logistic", "forest", "svm", "gboost", "extratrees", "knn")
+LOG_VOLUMES = ("log_eat_volume", "log_la_volume", "log_laeat_volume")
+VOLUMES = ("eat_volume_ml", "la_volume_ml", "laeat_volume_ml")
 NOT_A_FEATURE = {
     "patient_id",
     "group",
@@ -93,6 +96,7 @@ NOT_A_FEATURE = {
     "sex",
     "age",
     "bmi",
+    *LOG_VOLUMES,
 }
 CLINICAL_WORDS = ("hba1c", "cholesterol", "glucose", "bmi", "age", "sex", "pdff", "blood")
 
@@ -123,6 +127,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--jobs", type=int, default=1, help="threads per forest, 1 is the safe choice"
     )
     parser.add_argument("--trees", type=int, default=400)
+    parser.add_argument(
+        "--index-feature",
+        action="store_true",
+        help="add the fitted W**a * L**b * E**c index as one of the features",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -130,7 +139,39 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_known_args(argv)[0]
 
 
+class FittedIndex(BaseEstimator, TransformerMixin):
+    """Replace the leading log volumes by one learnt index W**a * L**b * E**c.
+
+    The exponents are the logistic coefficients on the log volumes, fitted on the
+    training part of each fold only, so the index costs one feature slot and
+    leaks nothing into the test part.
+    """
+
+    def __init__(self, columns: int = 3, seed: int = 0):
+        self.columns = columns
+        self.seed = seed
+
+    def fit(self, X, y=None):
+        head = np.asarray(X)[:, : self.columns]
+        model = LogisticRegression(max_iter=5000, C=1e6, random_state=self.seed)
+        model.fit(head, y)
+        self.exponents_ = model.coef_[0]
+        return self
+
+    def transform(self, X):
+        values = np.asarray(X)
+        index = values[:, : self.columns] @ self.exponents_
+        return np.column_stack([index, values[:, self.columns :]])
+
+
 def build_model(name: str, seed: int, args: argparse.Namespace):
+    if getattr(args, "with_index", False):
+        plain = argparse.Namespace(**{**vars(args), "with_index": False})
+        return make_pipeline(
+            SimpleImputer(strategy="median"),
+            FittedIndex(columns=len(LOG_VOLUMES), seed=seed),
+            build_model(name, seed, plain),
+        )
     if name == "logistic":
         return make_pipeline(
             SimpleImputer(strategy="median"),
@@ -376,7 +417,9 @@ def search(
     models = [name.strip() for name in args.models.split(",") if name.strip()]
     forced = [name for name in (forced or []) if name in table.columns]
     free = [name for name in pool if name not in forced]
-    slots = max(args.max_size - len(forced), 0)
+    use_index = args.index_feature and all(name in table.columns for name in LOG_VOLUMES)
+    args = argparse.Namespace(**{**vars(args), "with_index": use_index})
+    slots = max(args.max_size - len(forced) - int(use_index), 0)
     combinations = [tuple(forced) + names for names in itertools.combinations(free, slots)] or [
         tuple(forced)
     ]
@@ -385,10 +428,19 @@ def search(
         f"{len(combinations)} combinations"
     )
 
+    lead = list(LOG_VOLUMES) if use_index else []
+    shown = ["fit_index W**a*L**b*E**c"] if use_index else []
+
     rows = []
     for names in combinations:
-        auc, _, _ = score(pair[list(names)], target, "logistic", args)
-        rows.append({"features": " + ".join(names), "logistic": round(auc, 4), "_names": names})
+        auc, _, _ = score(pair[lead + list(names)], target, "logistic", args)
+        rows.append(
+            {
+                "features": " + ".join(shown + list(names)),
+                "logistic": round(auc, 4),
+                "_names": names,
+            }
+        )
     ranked = pd.DataFrame(rows).sort_values("logistic", ascending=False).reset_index(drop=True)
 
     best = {"group": group, "auc": 0.0}
@@ -400,7 +452,7 @@ def search(
                 continue
             try:
                 auc, spread, predicted = score(
-                    pair[list(row["_names"])], target, model_name, args
+                    pair[lead + list(row["_names"])], target, model_name, args
                 )
             except Exception as problem:  # noqa: BLE001 - a broken env costs one model, not the run
                 broken.add(model_name)
@@ -496,6 +548,10 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     table = read_tables(args)
     indices = add_indices(table)
+    if args.index_feature and all(name in table.columns for name in VOLUMES):
+        for log_name, column in zip(LOG_VOLUMES, VOLUMES, strict=True):
+            table[log_name] = np.log(table[column].where(table[column] > 0))
+        print("the fitted W**a * L**b * E**c index takes one of the feature slots")
     features = numeric_features(table)
     print(f"{len(table)} patients, {len(features)} image-only features, {len(indices)} indices")
     print(table["group"].value_counts().to_string())
