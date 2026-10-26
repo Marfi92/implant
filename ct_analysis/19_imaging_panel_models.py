@@ -119,6 +119,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="skip the measurements / radiomics / indices comparison",
     )
+    parser.add_argument(
+        "--jobs", type=int, default=1, help="threads per forest, 1 is the safe choice"
+    )
+    parser.add_argument("--trees", type=int, default=400)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -126,7 +130,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_known_args(argv)[0]
 
 
-def build_model(name: str, seed: int):
+def build_model(name: str, seed: int, args: argparse.Namespace):
     if name == "logistic":
         return make_pipeline(
             SimpleImputer(strategy="median"),
@@ -136,7 +140,9 @@ def build_model(name: str, seed: int):
     if name == "forest":
         return make_pipeline(
             SimpleImputer(strategy="median"),
-            RandomForestClassifier(n_estimators=400, random_state=seed, n_jobs=-1),
+            RandomForestClassifier(
+                n_estimators=args.trees, random_state=seed, n_jobs=args.jobs
+            ),
         )
     if name == "svm":
         return make_pipeline(
@@ -152,7 +158,9 @@ def build_model(name: str, seed: int):
     if name == "extratrees":
         return make_pipeline(
             SimpleImputer(strategy="median"),
-            ExtraTreesClassifier(n_estimators=400, random_state=seed, n_jobs=-1),
+            ExtraTreesClassifier(
+                n_estimators=args.trees, random_state=seed, n_jobs=args.jobs
+            ),
         )
     if name == "knn":
         return make_pipeline(
@@ -257,7 +265,7 @@ def score(
         folds = StratifiedKFold(
             n_splits=args.folds, shuffle=True, random_state=args.seed + repeat
         )
-        model = build_model(model_name, args.seed + repeat)
+        model = build_model(model_name, args.seed + repeat, args)
         predicted = cross_val_predict(
             model, values, target, cv=folds, method="predict_proba"
         )[:, 1]
@@ -385,11 +393,22 @@ def search(
 
     best = {"group": group, "auc": 0.0}
     compared = []
+    broken: set[str] = set()
     for position, row in ranked.head(args.refit).iterrows():
         for model_name in models:
-            auc, spread, predicted = score(
-                pair[list(row["_names"])], target, model_name, args
-            )
+            if model_name in broken:
+                continue
+            try:
+                auc, spread, predicted = score(
+                    pair[list(row["_names"])], target, model_name, args
+                )
+            except Exception as problem:  # noqa: BLE001 - a broken env costs one model, not the run
+                broken.add(model_name)
+                print(
+                    f"{group} ({label}): {model_name} skipped, "
+                    f"{type(problem).__name__}: {problem}"
+                )
+                continue
             ranked.loc[position, model_name] = round(auc, 4)
             compared.append(
                 {
