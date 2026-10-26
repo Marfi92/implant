@@ -34,6 +34,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--exclude-la",
         action="store_true",
         help="subtract the atrial cavity from the EAT mask, for masks not cleaned yet",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="every PyRadiomics class including shape, GLCM, GLRLM, GLDM and NGTDM",
+    )
+    parser.add_argument(
+        "--name",
+        default="",
+        help="workbook name, default radiomic_features.xlsx or _full with --full",
     )
     parser.add_argument("--la-dilate", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
@@ -129,8 +140,18 @@ WANTED = {
 extractor = None
 
 
-def radiomics_extractor(bin_width: float):
-    """PyRadiomics with only the first order and GLSZM classes switched on."""
+def short_name(key: str) -> str:
+    """original_shape_SurfaceVolumeRatio -> shape_surface_volume_ratio."""
+    key = key.replace("original_", "")
+    family, _, feature = key.partition("_")
+    feature = feature.replace("2D", "2d").replace("3D", "3d")
+    feature = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", feature)
+    feature = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", feature)
+    return f"{family}_{feature.lower()}"
+
+
+def radiomics_extractor(bin_width: float, full: bool = False):
+    """PyRadiomics, the small hand-picked set or every class with --full."""
     global extractor
     if extractor is None:
         import logging
@@ -139,6 +160,9 @@ def radiomics_extractor(bin_width: float):
 
         logging.getLogger("radiomics").setLevel(logging.ERROR)
         extractor = RadiomicsFeatureExtractor(binWidth=bin_width, label=1)
+        if full:
+            extractor.enableAllFeatures()  # shape, firstorder, glcm, glrlm, glszm, gldm, ngtdm
+            return extractor
         extractor.disableAllFeatures()
         extractor.enableFeaturesByName(
             firstorder=[
@@ -165,15 +189,24 @@ def radiomics_extractor(bin_width: float):
 
 
 def compartment_features(
-    image: sitk.Image, mask: np.ndarray, bin_width: float
+    image: sitk.Image, mask: np.ndarray, bin_width: float, full: bool = False
 ) -> dict[str, float]:
     """Run PyRadiomics on one binary mask and keep the wanted features."""
     if int(mask.sum()) < 10:
-        return {name: float("nan") for name in WANTED.values()}
+        return {} if full else {name: float("nan") for name in WANTED.values()}
     label_image = sitk.GetImageFromArray(mask.astype(np.uint8))
     label_image.CopyInformation(image)
-    result = radiomics_extractor(bin_width).execute(image, label_image)
+    result = radiomics_extractor(bin_width, full).execute(image, label_image)
     features: dict[str, float] = {}
+    if full:
+        for key, value in result.items():
+            if not str(key).startswith("original_"):
+                continue  # the diagnostics entries are not numbers
+            try:
+                features[short_name(str(key))] = round(float(value), 4)
+            except (TypeError, ValueError):
+                continue
+        return features
     for key, name in WANTED.items():
         value = result.get(f"original_{key}")
         features[name] = round(float(value), 4) if value is not None else float("nan")
@@ -227,7 +260,7 @@ def measure_one(
         if mask is None or not mask.any():
             continue
         row[f"{name}_volume_ml"] = round(float(mask.sum()) * millilitre, 2)
-        for key, value in compartment_features(image, mask, args.bin_width).items():
+        for key, value in compartment_features(image, mask, args.bin_width, args.full).items():
             row[f"{name}_{key}"] = value
 
     whole = row.get("eat_volume_ml")
@@ -270,7 +303,7 @@ def main(argv=None) -> None:
             )
             row["status"] = "ok"
             row["error"] = ""
-        except Exception as problem:
+        except Exception as problem:  # noqa: BLE001 - one bad scan must not stop the cohort
             row = {
                 "patient_id": patient,
                 "status": "failed",
@@ -309,7 +342,10 @@ def main(argv=None) -> None:
         helpers.draw_plots(good, args.output / "plots_radiomic")
 
     args.output.mkdir(parents=True, exist_ok=True)
-    path = args.output / "radiomic_features.xlsx"
+    name = args.name or (
+        "radiomic_features_full.xlsx" if args.full else "radiomic_features.xlsx"
+    )
+    path = args.output / name
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         table.to_excel(writer, sheet_name="Features", index=False)
         if not stats.empty:
