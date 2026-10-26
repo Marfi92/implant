@@ -451,6 +451,10 @@ def main(argv=None) -> None:
             pd.concat(composites).to_excel(writer, sheet_name="Composite", index=False)
         if univariates:
             pd.concat(univariates).to_excel(writer, sheet_name="Univariate", index=False)
+        if not (best_rows or tops or composites or univariates):
+            pd.DataFrame(
+                {"note": ["no group had enough patients for the search, nothing to report"]}
+            ).to_excel(writer, sheet_name="Notes", index=False)
     print(f"\nExcel : {path}")
     if not args.no_plots:
         print(f"Plots : {args.output / 'plots'}")

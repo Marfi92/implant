@@ -43,6 +43,7 @@ import pandas as pd
 BASE = Path(r"Q:\users\marfi\Automatic segmentations\finalllll\final\test80_analysis")
 FEATURES_FILE = BASE / "fat_la_features.xlsx"
 CLINICAL = Path(r"Q:\users\marfi\CT_analysis\SCAPIS1-DATA-PETITION-1110-20260407(in).csv")
+SKIP = {"patient_id", "status", "error", "group", "voxel_ml", "slice_mm", "cleaned_mask"}
 
 
 def load_random_forest_module():
@@ -293,7 +294,14 @@ def main(argv=None) -> None:
     if not args.no_derived:
         table, derived = add_derived(table)
 
-    columns = random_forest_module.feature_columns(table, extra + derived)
+    measured = [
+        name
+        for name in table.columns
+        if name not in SKIP
+        and name not in random_forest_module.IMAGE_FEATURES
+        and pd.api.types.is_numeric_dtype(table[name])
+    ]  # radiomic sheets carry their own columns, not the script 11 list
+    columns = random_forest_module.feature_columns(table, extra + derived + measured)
     print(f"{len(table)} patients, {len(columns)} features")
     print(f"derived: {', '.join(name for name in derived if name in columns) or 'none kept'}")
     print(table["group"].value_counts().to_string())

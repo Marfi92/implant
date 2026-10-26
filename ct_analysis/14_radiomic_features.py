@@ -48,7 +48,7 @@ COMPARTMENTS = ("la", "laeat", "eat")
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images", type=Path, default=BASE / "test80")
-    parser.add_argument("--eat-masks", type=Path, default=ANALYSIS / "fat_hu_masks_noLA")
+    parser.add_argument("--eat-masks", type=Path, default=ANALYSIS / "fat_hu_masks")
     parser.add_argument("--la-masks", type=Path, default=BASE / "test80_seg_la")
     parser.add_argument("--la-eat-masks", type=Path, default=None)
     parser.add_argument("--groups", type=Path, default=BASE / "test80" / "test80_groups.xlsx")

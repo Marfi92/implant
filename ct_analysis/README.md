@@ -289,7 +289,7 @@ python 13_compare_models.py --no-derived --groups AF
 
 ### 14. `14_radiomic_features.py` — PyRadiomics features per compartment
 
-Features for the left atrium, the LA-EAT and the whole-heart EAT, extracted with PyRadiomics so the definitions are the standard (IBSI) ones: first order `Mean`, `StandardDeviation`, `Skewness`, `Kurtosis`, `Entropy`, and GLSZM `SmallAreaEmphasis`, `LargeAreaEmphasis`, `GrayLevelNonUniformity`, `SizeZoneNonUniformity`, `ZonePercentage`, `ZoneEntropy`. Volumes in millilitres come from the voxel count. No HU window is applied here; the EAT masks are expected to be the cleaned ones with the atrial blood pool already removed (`fat_hu_masks_noLA`).
+Features for the left atrium, the LA-EAT and the whole-heart EAT, extracted with PyRadiomics so the definitions are the standard (IBSI) ones: first order `Mean`, `StandardDeviation`, `Skewness`, `Kurtosis`, `Entropy`, and GLSZM `SmallAreaEmphasis`, `LargeAreaEmphasis`, `GrayLevelNonUniformity`, `SizeZoneNonUniformity`, `ZonePercentage`, `ZoneEntropy`. Volumes in millilitres come from the voxel count. No HU window is applied here; the EAT masks are expected to be the cleaned ones with the atrial blood pool already removed (`fat_hu_masks`).
 
 If no LA-EAT mask folder is passed, LA-EAT is derived as the EAT sitting within `--la-eat-mm` (10 mm by default) of the atrial surface, measured by a distance transform in real millimetres. Grey levels are binned by `--bin-width` HU (25 by default), the PyRadiomics default style of fixed bin width rather than a fixed count.
 
