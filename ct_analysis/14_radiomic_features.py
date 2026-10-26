@@ -277,11 +277,19 @@ def main(argv=None) -> None:
                 "error": f"{type(problem).__name__}: {problem}",
             }
         rows.append(row)
-        print(
-            f"[{number}/{len(shared)}] {patient}: {row['status']} "
-            f"EAT {row.get('eat_volume_ml', '')} ml, LA {row.get('la_volume_ml', '')} ml, "
-            f"LA-EAT {row.get('laeat_volume_ml', '')} ml"
-        )
+        if row["status"] == "ok":
+            print(
+                f"[{number}/{len(shared)}] {patient}: ok "
+                f"EAT {row.get('eat_volume_ml', '')} ml, LA {row.get('la_volume_ml', '')} ml, "
+                f"LA-EAT {row.get('laeat_volume_ml', '')} ml"
+            )
+        else:
+            print(f"[{number}/{len(shared)}] {patient}: failed, {row['error']}")
+            if number >= 3 and all(item["status"] == "failed" for item in rows):
+                raise SystemExit(
+                    "the first cases all failed with the same error, fix that before "
+                    "running the whole cohort"
+                )
 
     table = pd.DataFrame(rows)
     groups = helpers.read_groups(args, table["patient_id"].tolist())
