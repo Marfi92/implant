@@ -549,7 +549,7 @@ def main(argv=None) -> None:
     table = read_tables(args)
     indices = add_indices(table)
     if args.index_feature and all(name in table.columns for name in VOLUMES):
-        for log_name, column in zip(LOG_VOLUMES, VOLUMES, strict=True):
+        for log_name, column in zip(LOG_VOLUMES, VOLUMES):  # noqa: B905 - 3.9 kernel
             table[log_name] = np.log(table[column].where(table[column] > 0))
         print("the fitted W**a * L**b * E**c index takes one of the feature slots")
     features = numeric_features(table)
