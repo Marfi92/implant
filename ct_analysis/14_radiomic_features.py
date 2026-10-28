@@ -82,6 +82,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="every PyRadiomics class including shape, GLCM, GLRLM, GLDM and NGTDM",
     )
     parser.add_argument(
+        "--filters",
+        default="",
+        help="image filters on top of --full, e.g. wavelet,log,square,squareroot,"
+        "logarithm,exponential,gradient. wavelet,log gives about 1000 per compartment",
+    )
+    parser.add_argument(
+        "--log-sigma",
+        default="1,3,5",
+        help="Laplacian of Gaussian sigmas in mm, used when log is among the filters",
+    )
+    parser.add_argument(
         "--name",
         default="",
         help="workbook name, default radiomic_features.xlsx or _full with --full",
@@ -141,16 +152,44 @@ extractor = None
 
 
 def short_name(key: str) -> str:
-    """original_shape_SurfaceVolumeRatio -> shape_surface_volume_ratio."""
-    key = key.replace("original_", "")
-    family, _, feature = key.partition("_")
+    """original_shape_SurfaceVolumeRatio -> shape_surface_volume_ratio.
+
+    A filtered feature keeps its image type, wavelet-LLH_glcm_Idmn becomes
+    wavelet_llh_glcm_idmn and log-sigma-3-0-mm-3D_firstorder_Mean becomes
+    log_sigma_3_0_firstorder_mean.
+    """
+    image_type, _, rest = key.partition("_")
+    prefix = ""
+    if image_type != "original":
+        prefix = (
+            image_type.replace("-mm-3D", "").replace("-", "_").replace(".", "_").lower() + "_"
+        )
+    family, _, feature = rest.partition("_")
     feature = feature.replace("2D", "2d").replace("3D", "3d")
     feature = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", feature)
     feature = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", feature)
-    return f"{family}_{feature.lower()}"
+    return f"{prefix}{family}_{feature.lower()}"
 
 
-def radiomics_extractor(bin_width: float, full: bool = False):
+def image_types(args: argparse.Namespace) -> dict[str, dict]:
+    """The filters asked for, each one re-computes every enabled feature class."""
+    wanted = [name.strip().lower() for name in args.filters.split(",") if name.strip()]
+    types: dict[str, dict] = {"Original": {}}
+    for name in wanted:
+        if name == "log":
+            sigmas = [float(value) for value in args.log_sigma.split(",") if value.strip()]
+            types["LoG"] = {"sigma": sigmas}
+        elif name == "wavelet":
+            types["Wavelet"] = {}
+        elif name in ("square", "squareroot", "logarithm", "exponential", "gradient"):
+            types[{"square": "Square", "squareroot": "SquareRoot", "logarithm": "Logarithm",
+                   "exponential": "Exponential", "gradient": "Gradient"}[name]] = {}
+        else:
+            raise SystemExit(f"unknown filter {name}")
+    return types
+
+
+def radiomics_extractor(bin_width: float, full: bool = False, filters: dict | None = None):
     """PyRadiomics, the small hand-picked set or every class with --full."""
     global extractor
     if extractor is None:
@@ -162,6 +201,9 @@ def radiomics_extractor(bin_width: float, full: bool = False):
         extractor = RadiomicsFeatureExtractor(binWidth=bin_width, label=1)
         if full:
             extractor.enableAllFeatures()  # shape, firstorder, glcm, glrlm, glszm, gldm, ngtdm
+            if filters and len(filters) > 1:
+                extractor.enableImageTypes(**filters)
+                print(f"image types: {', '.join(filters)}")
             return extractor
         extractor.disableAllFeatures()
         extractor.enableFeaturesByName(
@@ -189,18 +231,22 @@ def radiomics_extractor(bin_width: float, full: bool = False):
 
 
 def compartment_features(
-    image: sitk.Image, mask: np.ndarray, bin_width: float, full: bool = False
+    image: sitk.Image,
+    mask: np.ndarray,
+    bin_width: float,
+    full: bool = False,
+    filters: dict | None = None,
 ) -> dict[str, float]:
     """Run PyRadiomics on one binary mask and keep the wanted features."""
     if int(mask.sum()) < 10:
         return {} if full else {name: float("nan") for name in WANTED.values()}
     label_image = sitk.GetImageFromArray(mask.astype(np.uint8))
     label_image.CopyInformation(image)
-    result = radiomics_extractor(bin_width, full).execute(image, label_image)
+    result = radiomics_extractor(bin_width, full, filters).execute(image, label_image)
     features: dict[str, float] = {}
     if full:
         for key, value in result.items():
-            if not str(key).startswith("original_"):
+            if str(key).startswith("diagnostics_"):
                 continue  # the diagnostics entries are not numbers
             try:
                 features[short_name(str(key))] = round(float(value), 4)
@@ -260,7 +306,9 @@ def measure_one(
         if mask is None or not mask.any():
             continue
         row[f"{name}_volume_ml"] = round(float(mask.sum()) * millilitre, 2)
-        for key, value in compartment_features(image, mask, args.bin_width, args.full).items():
+        for key, value in compartment_features(
+            image, mask, args.bin_width, args.full, getattr(args, "image_types", None)
+        ).items():
             row[f"{name}_{key}"] = value
 
     whole = row.get("eat_volume_ml")
@@ -277,6 +325,9 @@ def measure_one(
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    args.image_types = image_types(args)
+    if args.filters and not args.full:
+        raise SystemExit("--filters only makes sense together with --full")
     helpers = shared_helpers()
     images = helpers.index_folder(args.images)
     eat = helpers.index_folder(args.eat_masks)
@@ -342,9 +393,14 @@ def main(argv=None) -> None:
         helpers.draw_plots(good, args.output / "plots_radiomic")
 
     args.output.mkdir(parents=True, exist_ok=True)
-    name = args.name or (
-        "radiomic_features_full.xlsx" if args.full else "radiomic_features.xlsx"
-    )
+    if args.name:
+        name = args.name
+    elif args.filters:
+        name = "radiomic_features_filters.xlsx"
+    elif args.full:
+        name = "radiomic_features_full.xlsx"
+    else:
+        name = "radiomic_features.xlsx"
     path = args.output / name
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         table.to_excel(writer, sheet_name="Features", index=False)
