@@ -67,6 +67,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--top-plot", type=int, default=20, help="combinations in the bar chart")
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_known_args(argv)[0]
 
@@ -168,6 +169,60 @@ def score(data: pd.DataFrame, target: np.ndarray, args: argparse.Namespace) -> f
     return float(np.mean(aucs))
 
 
+def combination_plots(
+    rows: pd.DataFrame, curve: pd.DataFrame, folder: Path, group: str, top: int
+) -> None:
+    """Which combinations win and which features keep appearing in the winners."""
+    best = rows.head(top)
+    labels = [name.replace(" + ", "\n") for name in best["features"]]
+    plt.figure(figsize=(8, 0.5 * len(best) + 1.5))
+    plt.barh(range(len(best)), best["auc"], color="#3b6ea5")
+    plt.yticks(range(len(best)), labels, fontsize=6)
+    plt.gca().invert_yaxis()
+    plt.xlim(max(0.5, best["auc"].min() - 0.05), best["auc"].max() + 0.01)
+    plt.xlabel("out-of-fold AUC")
+    plt.title(f"{group} vs control, best {len(best)} combinations")
+    plt.tight_layout()
+    plt.savefig(folder / f"{group.lower()}_best_combinations.png", dpi=200)
+    plt.close()
+
+    winners = rows.head(max(top * 5, 50))
+    counts: dict[str, int] = {}
+    for names in winners["features"]:
+        for name in names.split(" + "):
+            counts[name] = counts.get(name, 0) + 1
+    order = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:20]
+    if order:
+        plt.figure(figsize=(7, 0.35 * len(order) + 1.5))
+        plt.barh([name for name, _ in order], [count for _, count in order], color="#9a5b3b")
+        plt.gca().invert_yaxis()
+        plt.yticks(fontsize=7)
+        plt.xlabel(f"appearances among the best {len(winners)} models")
+        plt.tight_layout()
+        plt.savefig(folder / f"{group.lower()}_feature_frequency.png", dpi=200)
+        plt.close()
+
+    heat = curve.pivot(index="size", columns="block", values="auc")
+    plt.figure(figsize=(5, 4))
+    plt.imshow(heat.to_numpy(dtype=float), cmap="viridis", aspect="auto")
+    plt.colorbar(label="AUC")
+    plt.xticks(range(len(heat.columns)), heat.columns, rotation=30, ha="right", fontsize=8)
+    plt.yticks(range(len(heat.index)), heat.index)
+    plt.ylabel("features in the model")
+    for row, size in enumerate(heat.index):
+        for column, block in enumerate(heat.columns):
+            value = heat.loc[size, block]
+            if pd.notna(value):
+                plt.text(
+                    column, row, f"{value:.3f}", ha="center", va="center",
+                    color="white", fontsize=7,
+                )
+    plt.title(f"{group} vs control")
+    plt.tight_layout()
+    plt.savefig(folder / f"{group.lower()}_block_size_heatmap.png", dpi=200)
+    plt.close()
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     table = read_tables(args)
@@ -236,13 +291,12 @@ def main(argv=None) -> None:
             print(f"{label:13s} {size} feature(s): AUC {best['auc']:.4f}  {best['features']}")
 
     curve_table = pd.DataFrame(curve)
+    all_rows = pd.DataFrame(rows).sort_values("auc", ascending=False)
     args.output.mkdir(parents=True, exist_ok=True)
     path = args.output / f"{args.group.lower()}_size_curve.xlsx"
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         curve_table.to_excel(writer, sheet_name="Curve", index=False)
-        pd.DataFrame(rows).sort_values("auc", ascending=False).to_excel(
-            writer, sheet_name="All", index=False
-        )
+        all_rows.to_excel(writer, sheet_name="All", index=False)
         ranked.to_excel(writer, sheet_name="Univariate", index=False)
 
     print("\nAUC by number of features")
@@ -261,6 +315,7 @@ def main(argv=None) -> None:
         plt.tight_layout()
         plt.savefig(folder / f"{args.group.lower()}_size_curve.png", dpi=200)
         plt.close()
+        combination_plots(all_rows, curve_table, folder, args.group, args.top_plot)
 
     print(f"\nExcel : {path}")
 
