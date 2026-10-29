@@ -83,6 +83,8 @@ def main():
     ap.add_argument('--topk-all', type=int, default=10,
                     help='k for votetopk_all (sum of top-k implant similarities)')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--per-split-out', default=None,
+                    help='optional CSV with one row per split and method (for paired tests)')
     args = ap.parse_args()
     use_lexical = not args.no_lexical
     use_full = not args.no_full_sim
@@ -164,6 +166,7 @@ def main():
     methods += ['hybrid', 'pu_lr', 'pu_rn']
     metric_names = ['roc_auc', 'average_precision'] + [f'precision_at_{k}' for k in ks]
     results = {m: {mn: [] for mn in metric_names} for m in methods}
+    per_split_rows = []
 
     for sid, sp in split_items:
         ref, test = sp['ref'], sp['test']
@@ -276,6 +279,9 @@ def main():
             results[m]['average_precision'].append(average_precision_score(y, s))
             for k in ks:
                 results[m][f'precision_at_{k}'].append(precision_at_k(y_sorted, k))
+            row = {'split': sid, 'method': m, 'P': int(y.sum()), 'N': int(len(y) - y.sum())}
+            row.update({mn: results[m][mn][-1] for mn in metric_names})
+            per_split_rows.append(row)
 
     # ---- aggregate + print
     print("\n" + "=" * 78)
@@ -293,6 +299,13 @@ def main():
     print("=" * 78)
     n_used = len(results['vote']['roc_auc'])
     print(f"splits used: {n_used}")
+    if args.per_split_out and per_split_rows:
+        import csv
+        with open(args.per_split_out, 'w', newline='') as f:
+            wr = csv.DictWriter(f, fieldnames=list(per_split_rows[0].keys()))
+            wr.writeheader()
+            wr.writerows(per_split_rows)
+        print(f"per-split results written to {args.per_split_out}")
 
 
 if __name__ == '__main__':
