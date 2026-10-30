@@ -21,6 +21,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--group", default="AF", help="AF, HF or stroke")
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--features", default="", help="comma separated panel to score")
+    parser.add_argument(
+        "--combine",
+        default="",
+        help="panel sizes to search, e.g. 2,3,4, over every feature above --min-auc",
+    )
+    parser.add_argument(
+        "--min-auc", type=float, default=0.72, help="a feature enters the search above this AUC"
+    )
+    parser.add_argument(
+        "--print-above", type=float, default=0.76, help="print a combination above this AUC"
+    )
+    parser.add_argument("--show", type=int, default=15, help="best combinations shown per size")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--trees", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
@@ -147,6 +160,59 @@ def panel_auc(data: pd.DataFrame, target: np.ndarray, args: argparse.Namespace) 
         print(f"  {name:10s} AUC {roc_auc_score(target, predicted[:, 1]):.4f}")
 
 
+def single_panel_auc(
+    data: pd.DataFrame, target: np.ndarray, args: argparse.Namespace
+) -> float:
+    """Out-of-fold AUC of a logistic regression on these columns."""
+    model = make_pipeline(
+        SimpleImputer(strategy="median"), StandardScaler(), LogisticRegression(max_iter=2000)
+    )
+    folds = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+    predicted = cross_val_predict(
+        model, data.to_numpy(dtype=float), target, cv=folds, method="predict_proba"
+    )
+    return float(roc_auc_score(target, predicted[:, 1]))
+
+
+def search_combinations(
+    pair: pd.DataFrame, target: np.ndarray, usable: list[str], args: argparse.Namespace
+) -> None:
+    """Every combination of the good single features, printed when it beats the bar."""
+
+    sizes = [int(value) for value in args.combine.split(",") if value.strip()]
+    pool = [
+        name
+        for name in usable
+        if max(rank_auc(pair[name], target), 1 - rank_auc(pair[name], target)) >= args.min_auc
+    ]
+    print(f"\n{len(pool)} features at or above AUC {args.min_auc} enter the search")
+    if not pool:
+        return
+    best_overall = ("", 0.0)
+    for size in sizes:
+        total = len(list(itertools.combinations(range(len(pool)), size)))
+        print(f"\nsize {size}: {total} combinations, printing those above {args.print_above}")
+        found = []
+        for names in itertools.combinations(pool, size):
+            auc = single_panel_auc(pair[list(names)], target, args)
+            if auc > best_overall[1]:
+                best_overall = (" + ".join(names), auc)
+            if auc > args.print_above:
+                found.append((auc, names))
+        found.sort(reverse=True)
+        if not found:
+            print(f"  none above {args.print_above}")
+        for auc, names in found[: args.show]:
+            print(f"  AUC {auc:.4f}  {' + '.join(names)}")
+        if len(found) > args.show:
+            print(f"  and {len(found) - args.show} more above {args.print_above}")
+    print(f"\nbest of the whole search: AUC {best_overall[1]:.4f}  {best_overall[0]}")
+    print(
+        "careful, this maximum is chosen on the same patients it is scored on, "
+        "script 23 gives the honest number"
+    )
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     table = read_tables(args)
@@ -211,6 +277,10 @@ def main(argv=None) -> None:
         print("\nratios, powers and indices")
         for name in sorted(indices, key=lambda name: -abs(rank_auc(pair[name], target) - 0.5)):
             print(line(name, pair[name], target))
+
+    if args.combine:
+        search_combinations(pair, target, usable, args)
+        return
 
     chosen = [name.strip() for name in args.features.split(",") if name.strip()]
     missing = [name for name in chosen if name not in pair.columns]
