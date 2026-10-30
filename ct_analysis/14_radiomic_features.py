@@ -34,6 +34,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 from pathlib import Path
 
@@ -96,6 +97,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--name",
         default="",
         help="workbook name, default radiomic_features.xlsx or _full with --full",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="start from scratch, by default the partial csv is read and extended",
     )
     parser.add_argument("--la-dilate", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
@@ -323,6 +329,40 @@ def measure_one(
     return row
 
 
+def workbook_name(args: argparse.Namespace) -> str:
+    if args.name:
+        return args.name
+    if args.filters:
+        return "radiomic_features_filters.xlsx"
+    if args.full:
+        return "radiomic_features_full.xlsx"
+    return "radiomic_features.xlsx"
+
+
+def done_so_far(path: Path, resume: bool) -> list[dict]:
+    """Rows from an earlier run of the same workbook, so a crash costs nothing."""
+    if not resume or not path.exists():
+        return []
+    table = pd.read_csv(path)
+    print(f"resuming, {len(table)} patients already done in {path.name}")
+    return table.to_dict("records")
+
+
+def append_row(path: Path, row: dict, first: bool) -> None:
+    """One line per patient, written immediately, so nothing is lost on a restart."""
+    frame = pd.DataFrame([row])
+    if first and not path.exists():
+        frame.to_csv(path, index=False)
+        return
+    old = pd.read_csv(path, nrows=0)
+    missing = [name for name in frame.columns if name not in old.columns]
+    if missing:  # a later patient has features the first one did not produce
+        whole = pd.concat([pd.read_csv(path), frame], ignore_index=True)
+        whole.to_csv(path, index=False)
+        return
+    frame.reindex(columns=old.columns).to_csv(path, mode="a", header=False, index=False)
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     args.image_types = image_types(args)
@@ -344,7 +384,14 @@ def main(argv=None) -> None:
     if not shared:
         raise SystemExit("no patient has both an image and an EAT mask, check the folders")
 
-    rows = []
+    args.output.mkdir(parents=True, exist_ok=True)
+    partial = args.output / (workbook_name(args).replace(".xlsx", "") + "_partial.csv")
+    rows = done_so_far(partial, not args.no_resume)
+    already = {str(row["patient_id"]) for row in rows}
+    shared = [patient for patient in shared if str(patient) not in already]
+    if already:
+        print(f"{len(shared)} patients left")
+
     for number, patient in enumerate(shared, start=1):
         try:
             row = measure_one(
@@ -361,6 +408,8 @@ def main(argv=None) -> None:
                 "error": f"{type(problem).__name__}: {problem}",
             }
         rows.append(row)
+        append_row(partial, row, first=len(rows) == 1)
+        gc.collect()
         if row["status"] == "ok":
             print(
                 f"[{number}/{len(shared)}] {patient}: ok "
@@ -376,6 +425,8 @@ def main(argv=None) -> None:
                 )
 
     table = pd.DataFrame(rows)
+    if "status" not in table.columns:
+        raise SystemExit("nothing was measured")
     groups = helpers.read_groups(args, table["patient_id"].tolist())
     table = table.merge(groups, on="patient_id", how="left")
     table["group"] = table["group"].fillna("unknown")
@@ -392,16 +443,7 @@ def main(argv=None) -> None:
     if not args.no_plots:
         helpers.draw_plots(good, args.output / "plots_radiomic")
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    if args.name:
-        name = args.name
-    elif args.filters:
-        name = "radiomic_features_filters.xlsx"
-    elif args.full:
-        name = "radiomic_features_full.xlsx"
-    else:
-        name = "radiomic_features.xlsx"
-    path = args.output / name
+    path = args.output / workbook_name(args)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         table.to_excel(writer, sheet_name="Features", index=False)
         if not stats.empty:

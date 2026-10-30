@@ -57,6 +57,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--radiomics", type=Path, default=ANALYSIS / "radiomic_features_full.xlsx")
     parser.add_argument("--measurements", type=Path, default=ANALYSIS / "fat_la_features.xlsx")
+    parser.add_argument(
+        "--extra", type=Path, default=None, help="a third workbook, e.g. new_measurements.xlsx"
+    )
     parser.add_argument("--group", default="AF", help="AF, HF or stroke")
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--features", default="", help="comma separated panel to score")
@@ -80,7 +83,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def read_tables(args: argparse.Namespace) -> pd.DataFrame:
     frames = []
-    for path in (args.measurements, args.radiomics):
+    for path in (args.measurements, args.radiomics, args.extra):
         if not path or not path.exists():
             print(f"missing {path}, skipped")
             continue
