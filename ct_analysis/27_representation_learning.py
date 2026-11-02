@@ -472,7 +472,8 @@ def finetune_cv(crops: np.ndarray, target: np.ndarray, args, folder: Path, journ
     device = "cuda" if torch.cuda.is_available() else "cpu"
     splitter = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     # the key carries the settings, so changing them does not reuse the old folds
-    tag = f"folds {signature(args)} safe={args.fold_safe} k={args.folds} ft={args.finetune_epochs}"
+    tag = (f"folds {signature(args)} safe={args.fold_safe} k={args.folds}"
+           f" ft={args.finetune_epochs} n={len(target)}")
     done = journal.get(tag) or {}
     scores = np.zeros(len(target), dtype=float)
     folds = []
