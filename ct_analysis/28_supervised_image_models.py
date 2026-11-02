@@ -538,6 +538,13 @@ def main(argv=None) -> None:
     target = np.array([1 if label_of[name] == args.group else 0 for name in ids])
     aux_target = volumes_of(crops)
     print(f"1. {len(ids)} patients, {int(target.sum())} {args.group}, box {crops.shape[2:]}")
+    cohort = int(groups["group"].isin([args.group, "control"]).sum())
+    if not args.limit and len(ids) < 0.9 * cohort:
+        print(
+            f"   WARNING: the workbook holds {cohort} {args.group}/control patients but crops.npz holds"
+            f" only {len(ids)}. The cropping run in script 27 was probably interrupted; rerun it with"
+            " --recrop and let it finish, otherwise every AUC below is noise."
+        )
     if target.sum() < 10 or (len(target) - target.sum()) < 10:
         raise SystemExit("too few patients of one class to cross-validate")
 
