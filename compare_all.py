@@ -66,7 +66,7 @@ def load_set(path):
 
 def write_examples(outdir, sid, qwords, qvecs, eval_idx, y, score, lex, mindist_all,
                    full_sim, gloss_words, ref, ref_idx, test_pos, neg_pool_idx, rng,
-                   top_n=100, n_label=25):
+                   top_n=100, label_terms=None):
     """Top-ranked pu_lr candidates of one split (CSV) and a 2-D PCA plot of the vectors."""
     import csv
     import os
@@ -118,23 +118,52 @@ def write_examples(outdir, sid, qwords, qvecs, eval_idx, y, score, lex, mindist_
               (f'top {top_n}: held-out implant', top_hit, '#c44e52', 30)]
     allidx = np.concatenate([g[1] for g in groups])
     xy = PCA(n_components=2, random_state=0).fit_transform(qvecs[allidx])
-    fig, ax = plt.subplots(figsize=(9, 7))
-    o = 0
     pts = {}
+    o = 0
     for name, idx, col, sz in groups:
-        p = xy[o:o + len(idx)]
-        o += len(idx)
-        ax.scatter(p[:, 0], p[:, 1], s=sz, c=col, label=name, alpha=0.8, linewidths=0)
-        for i, q in zip(idx, p):
+        for i, q in zip(idx, xy[o:o + len(idx)]):
             pts[int(i)] = q
-    for i in top_idx[:n_label]:
-        ax.annotate(qwords[i], pts[int(i)], fontsize=7)
-    ax.set_xlabel('PC 1')
-    ax.set_ylabel('PC 2')
-    ax.set_title(f'Word vectors (PCA), split {sid}')
-    ax.legend(fontsize=8, loc='best')
+        o += len(idx)
+    word_pt = {qwords[i]: q for i, q in pts.items()}
+    labels = [w for w in (label_terms or []) if w in word_pt]
+    if not labels:
+        labels = [qwords[i] for i in top_idx[:10]]
+    top_xy = np.array([pts[int(i)] for i in top_idx])
+    lab_xy = np.array([word_pt[w] for w in labels])
+    lo = np.minimum(np.percentile(top_xy, 3, axis=0), lab_xy.min(axis=0))
+    hi = np.maximum(np.percentile(top_xy, 97, axis=0), lab_xy.max(axis=0))
+    pad = 0.08 * (hi - lo)
+    lo, hi = lo - pad, hi + pad
+
+    plt.rcParams.update({'font.size': 11})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.5), gridspec_kw={'width_ratios': [1, 1.35]})
+    for ax, scale in [(ax1, 0.7), (ax2, 1.3)]:
+        o = 0
+        for name, idx, col, sz in groups:
+            p = xy[o:o + len(idx)]
+            o += len(idx)
+            ax.scatter(p[:, 0], p[:, 1], s=sz * scale, c=col, label=name, alpha=0.75, linewidths=0)
+    ax1.add_patch(plt.Rectangle(lo, *(hi - lo), fill=False, ec='black', lw=1.2, ls='--'))
+    ax1.set_title('A  All terms')
+    ax1.set_xlabel('PC 1')
+    ax1.set_ylabel('PC 2')
+    ax1.legend(fontsize=9, loc='upper right', framealpha=0.9)
+
+    span = hi - lo
+    ax2.set_xlim(lo[0], hi[0] + 0.55 * span[0])
+    ax2.set_ylim(lo[1], hi[1])
+    ax2.set_title('B  Zoom on the implant region (dashed box in A)')
+    ax2.set_xlabel('PC 1')
+    ax2.set_ylabel('PC 2')
+    lab = sorted(labels, key=lambda w: -word_pt[w][1])
+    ys = np.linspace(hi[1] - 0.06 * span[1], lo[1] + 0.06 * span[1], len(lab)) if len(lab) > 1 else [word_pt[lab[0]][1]]
+    xtext = hi[0] + 0.08 * span[0]
+    for w, yt in zip(lab, ys):
+        ax2.annotate(w, xy=word_pt[w], xytext=(xtext, yt), fontsize=10, va='center',
+                     arrowprops=dict(arrowstyle='-', color='0.35', lw=0.7))
+        ax2.scatter(*word_pt[w], s=60, facecolors='none', edgecolors='black', linewidths=1.0)
     fig.tight_layout()
-    fig.savefig(os.path.join(outdir, 'embedding_pca.png'), dpi=200)
+    fig.savefig(os.path.join(outdir, 'embedding_pca.png'), dpi=300)
     plt.close(fig)
     print(f"examples written to {outdir} (top_candidates.csv, missed_heldout_implants.csv, embedding_pca.png)")
 
@@ -162,6 +191,8 @@ def main():
                     help='optional CSV with one row per split and method (for paired tests)')
     ap.add_argument('--examples-out', default=None,
                     help='optional folder: example top-ranked pu_lr terms and a 2-D plot (first split)')
+    ap.add_argument('--label-terms', default=None,
+                    help='comma-separated terms to label in the examples plot')
     ap.add_argument('--max-splits', type=int, default=None,
                     help='use only the first N splits (e.g. 1 for a quick examples run)')
     args = ap.parse_args()
@@ -356,7 +387,8 @@ def main():
         if args.examples_out and sid == split_items[0][0]:
             write_examples(args.examples_out, sid, qwords, qvecs, eval_idx, y, pu_lr_all,
                            lex, mindist_all, full_sim, gloss_words, ref, ref_idx, test_pos,
-                           neg_pool_idx, rng)
+                           neg_pool_idx, rng,
+                           label_terms=args.label_terms.split(',') if args.label_terms else None)
         for m in methods:
             s = score_map[m][eval_idx]
             order = np.argsort(-s, kind='stable')
