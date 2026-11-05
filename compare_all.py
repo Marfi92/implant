@@ -64,6 +64,81 @@ def load_set(path):
         return {ln.split()[0] for ln in f if ln.strip()}
 
 
+def write_examples(outdir, sid, qwords, qvecs, eval_idx, y, score, lex, mindist_all,
+                   full_sim, gloss_words, ref, ref_idx, test_pos, neg_pool_idx, rng,
+                   top_n=100, n_label=25):
+    """Top-ranked pu_lr candidates of one split (CSV) and a 2-D PCA plot of the vectors."""
+    import csv
+    import os
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    os.makedirs(outdir, exist_ok=True)
+    ref_set = set(ref)
+    ref_cols = [c for c, w in enumerate(gloss_words) if w in ref_set]
+    s = score[eval_idx]
+    order = np.argsort(-s, kind='stable')
+    ranked = eval_idx[order]
+    rank_of = {int(i): r + 1 for r, i in enumerate(ranked)}
+
+    def nearest_ref(i):
+        if full_sim is None or not ref_cols:
+            return '', float('nan')
+        sims = full_sim[i, ref_cols]
+        j = int(np.argmax(sims))
+        return gloss_words[ref_cols[j]], float(sims[j])
+
+    def row(i, label):
+        nr, ns = nearest_ref(i)
+        return {'rank': rank_of[int(i)], 'term': qwords[i], 'label': label,
+                'pu_lr': round(float(score[i]), 4),
+                'lexical': round(float(lex[i]), 4) if lex is not None else '',
+                'mindist_all': round(float(mindist_all[i]), 4) if mindist_all is not None else '',
+                'nearest_reference_implant': nr, 'similarity_to_it': round(ns, 4)}
+
+    top = [row(i, 'held-out implant' if y[order[r]] else 'not in glossary')
+           for r, i in enumerate(ranked[:top_n])]
+    pos_idx = np.flatnonzero(test_pos)
+    missed = sorted((row(i, 'held-out implant') for i in pos_idx), key=lambda d: -d['rank'])[:20]
+    for name, rows in [('top_candidates.csv', top), ('missed_heldout_implants.csv', missed)]:
+        with open(os.path.join(outdir, name), 'w', newline='', encoding='utf-8') as f:
+            wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            wr.writeheader()
+            wr.writerows(rows)
+
+    top_idx = ranked[:top_n]
+    top_hit = top_idx[y[order[:top_n]] == 1]
+    top_new = top_idx[y[order[:top_n]] == 0]
+    bg = rng.choice(neg_pool_idx, size=min(3000, len(neg_pool_idx)), replace=False)
+    groups = [('unlabelled terms (random sample)', bg, '#d9d9d9', 6),
+              ('reference implants', np.array(ref_idx), '#4c72b0', 10),
+              ('held-out implants', pos_idx, '#55a868', 18),
+              (f'top {top_n}: not in glossary', top_new, '#dd8452', 22),
+              (f'top {top_n}: held-out implant', top_hit, '#c44e52', 30)]
+    allidx = np.concatenate([g[1] for g in groups])
+    xy = PCA(n_components=2, random_state=0).fit_transform(qvecs[allidx])
+    fig, ax = plt.subplots(figsize=(9, 7))
+    o = 0
+    pts = {}
+    for name, idx, col, sz in groups:
+        p = xy[o:o + len(idx)]
+        o += len(idx)
+        ax.scatter(p[:, 0], p[:, 1], s=sz, c=col, label=name, alpha=0.8, linewidths=0)
+        for i, q in zip(idx, p):
+            pts[int(i)] = q
+    for i in top_idx[:n_label]:
+        ax.annotate(qwords[i], pts[int(i)], fontsize=7)
+    ax.set_xlabel('PC 1')
+    ax.set_ylabel('PC 2')
+    ax.set_title(f'Word vectors (PCA), split {sid}')
+    ax.legend(fontsize=8, loc='best')
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, 'embedding_pca.png'), dpi=200)
+    plt.close(fig)
+    print(f"examples written to {outdir} (top_candidates.csv, missed_heldout_implants.csv, embedding_pca.png)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('lancedb', help='path to lancedb_direct')
@@ -85,6 +160,10 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--per-split-out', default=None,
                     help='optional CSV with one row per split and method (for paired tests)')
+    ap.add_argument('--examples-out', default=None,
+                    help='optional folder: example top-ranked pu_lr terms and a 2-D plot (first split)')
+    ap.add_argument('--max-splits', type=int, default=None,
+                    help='use only the first N splits (e.g. 1 for a quick examples run)')
     args = ap.parse_args()
     use_lexical = not args.no_lexical
     use_full = not args.no_full_sim
@@ -119,6 +198,8 @@ def main():
     with open(args.splits_file) as f:
         splits = json.load(f)
     split_items = list(splits.items())
+    if args.max_splits:
+        split_items = split_items[:args.max_splits]
     stop = load_set(args.stop_list)
     first = split_items[0][1]
     implant_all = set(first['ref']) | set(first['dev']) | set(first['test'])
@@ -132,6 +213,7 @@ def main():
     # ---- full-embedding similarity to ALL implants (no top-128 cutoff)
     full_sim = None
     gloss_col = {}
+    gloss_words = []
     if use_full:
         print("Building full query x all-implants similarity (no 128 cutoff) ...")
         gloss_words = [w for w in implant_all if w in word2vec]
@@ -271,6 +353,10 @@ def main():
             score_map['votetopk_all'] = votetopk_all
         if use_lexical:
             score_map['lexical'] = lex
+        if args.examples_out and sid == split_items[0][0]:
+            write_examples(args.examples_out, sid, qwords, qvecs, eval_idx, y, pu_lr_all,
+                           lex, mindist_all, full_sim, gloss_words, ref, ref_idx, test_pos,
+                           neg_pool_idx, rng)
         for m in methods:
             s = score_map[m][eval_idx]
             order = np.argsort(-s, kind='stable')
