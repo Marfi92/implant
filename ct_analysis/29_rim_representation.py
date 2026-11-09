@@ -214,19 +214,66 @@ def crop_one(image_path: Path, la_path: Path, fat_path: Path, args) -> np.ndarra
     return stacked.astype(np.uint8)
 
 
+class Subset:
+    """A view of the crops, so a training fold is never copied into memory.
+
+    A 991 x 2 x 64 x 160 x 160 cache is 3 GB, and crops[train] would ask the
+    machine for another 2.4 GB. This hands out the batches only, which is all
+    the training loop ever reads.
+    """
+
+    def __init__(self, data, index):
+        self.data = data
+        self.index = np.asarray(index)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            return np.asarray(self.data[self.index[key[0]]])[(slice(None), *key[1:])]
+        return np.asarray(self.data[self.index[key]])
+
+    @property
+    def shape(self):
+        return (len(self.index), *self.data.shape[1:])
+
+
+def flat_cache(cache: Path, tag: np.ndarray) -> tuple:
+    """The cache memory mapped, read from disk in batches instead of held in RAM.
+
+    A compressed npz has to be unpacked whole, which needs twice its size in
+    memory, so it is unpacked once into a plain .npy beside it and only that is
+    opened from then on.
+    """
+    flat = cache.with_name(cache.stem + "_flat.npy")
+    note = cache.with_name(cache.stem + "_flat.json")
+    if flat.exists() and note.exists():
+        meta = json.loads(note.read_text())
+        if np.allclose(np.asarray(meta["settings"], dtype=float), tag):
+            print(f"crops: {len(meta['patient_id'])} reused, memory mapped from {flat.name}")
+            return [str(name) for name in meta["patient_id"]], np.load(flat, mmap_mode="r")
+    if not cache.exists():
+        return [], None
+    stored = np.load(cache, allow_pickle=True)
+    if not np.allclose(np.asarray(stored["settings"], dtype=float), tag):
+        print(f"crops: the cache was cut with other settings ({stored['settings']}), cutting again")
+        return [], None
+    names = [str(name) for name in stored["patient_id"]]
+    print(f"crops: unpacking {len(names)} to {flat.name} once, this takes a few minutes")
+    np.save(flat, stored["crops"])
+    note.write_text(json.dumps({"patient_id": names, "settings": [float(value) for value in tag]}))
+    del stored
+    return names, np.load(flat, mmap_mode="r")
+
+
 def build_crops(args: argparse.Namespace, patients: list, folder: Path) -> tuple:
     """Cropped boxes, written as they are cut so a crash loses at most 25 patients."""
     cache = args.crops or (folder / "rim_crops.npz")
-    done = {}
     tag = np.array([*args.box, args.spacing, *args.hu], dtype=float)
-    if cache.exists() and not args.recrop:
-        stored = np.load(cache, allow_pickle=True)
-        if np.allclose(np.asarray(stored["settings"], dtype=float), tag):
-            for number, name in enumerate(stored["patient_id"]):
-                done[str(name)] = stored["crops"][number]
-            print(f"crops: {len(done)} already cut, reused from {cache.name}")
-        else:
-            print(f"crops: the cache was cut with other settings ({stored['settings']}), cutting again")
+    cached, mapped = ([], None) if args.recrop else flat_cache(cache, tag)
+    position = {name: number for number, name in enumerate(cached)}
+    done = {}
 
     images = find_images(args.images)
     la_masks = find_images(args.la_masks) if args.la_masks.exists() else {}
@@ -234,13 +281,24 @@ def build_crops(args: argparse.Namespace, patients: list, folder: Path) -> tuple
     wanted = [name for name in patients if name in images]
     if args.limit:
         wanted = wanted[: args.limit]
-    missing = [name for name in wanted if name not in done]
-    if missing:
-        print(f"  {len(missing)} of {len(wanted)} still to cut at {args.spacing} mm")
+    missing = [name for name in wanted if name not in position]
+    if not missing and mapped is not None:
+        # nothing to cut, so the cache is used where it lies, nothing is copied
+        order = [position[name] for name in wanted]
+        crops = mapped if order == list(range(len(mapped))) else Subset(mapped, order)
+        print(f"crops: {tuple(crops.shape)} memory mapped, no patient cut")
+        return crops, wanted
+    if mapped is not None:
+        for name in wanted:
+            if name in position:
+                done[name] = np.asarray(mapped[position[name]])
+    print(f"  {len(missing)} of {len(wanted)} still to cut at {args.spacing} mm")
 
     def save() -> None:
         order = [name for name in wanted if name in done]
         cache.parent.mkdir(parents=True, exist_ok=True)
+        for stale in (cache.with_name(cache.stem + "_flat.npy"), cache.with_name(cache.stem + "_flat.json")):
+            stale.unlink(missing_ok=True)  # the memory mapped copy is out of date now
         np.savez_compressed(
             cache,
             crops=np.stack([done[name] for name in order]),
@@ -697,13 +755,14 @@ def plot_attention(model, device, crops, args, folder: Path, group: str) -> None
 
     model.eval()
     index = np.arange(min(len(crops), 16))
+    boxes = crops[index]
     with torch.no_grad():
-        batch = as_float(crops[index]).to(device)
+        batch = as_float(boxes).to(device)
         _, maps, _ = model.encoder(batch)
         scores = model.encoder.pools[0].score(maps[0])
         weight = torch.softmax(scores.flatten(2), dim=2).view_as(scores)
     picture = weight[:, 0].mean(dim=0).cpu().numpy()
-    image = crops[index, 0].astype(np.float32).mean(axis=0) / 255.0
+    image = np.asarray(boxes)[:, 0].astype(np.float32).mean(axis=0) / 255.0
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.4))
     cuts = (
         ("axial", picture.mean(axis=0), image[image.shape[0] // 2]),
@@ -802,7 +861,7 @@ def main(argv=None) -> None:
         print(f"  repeat {repeat} fold {number}, {len(train)} train, {len(test)} test")
         scaled = standardise(aim, train)
         base, device = pretrain(
-            crops[train],
+            Subset(crops, train),
             None if scaled is None else scaled[train],
             args,
             folder / f"pretrain_r{repeat}_f{number}.pt",

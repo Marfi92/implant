@@ -342,7 +342,7 @@ def main(argv=None) -> None:
         print(f"  repeat {repeat} fold {number}, {len(train)} train, {len(test)} test")
         aim = RIM.standardise(concepts, train)
         model, device = RIM.pretrain(
-            crops[train], aim[train] if aim is not None else None, args,
+            RIM.Subset(crops, train), aim[train] if aim is not None else None, args,
             folder / f"pretrain_r{repeat}_f{number}.pt", quiet=False,
         )
         values, names = latent_radiomics(model, device, crops, args)
