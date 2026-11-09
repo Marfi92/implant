@@ -93,11 +93,17 @@ def read_series(args: argparse.Namespace) -> pd.DataFrame:
 
 def per_patient(series: pd.DataFrame, cycle: int) -> pd.DataFrame:
     """One row per patient: how many phases, and whether a cycle was reconstructed."""
-    columns = {name.lower(): name for name in series.columns}
+    columns = {}
+    for name in series.columns:  # a repeated header must not turn a column into a frame
+        columns.setdefault(str(name).strip().lower(), name)
+
     def column(*names, default=""):
         for name in names:
             if name in columns:
-                return series[columns[name]]
+                found = series[columns[name]]
+                if isinstance(found, pd.DataFrame):
+                    found = found.iloc[:, 0]
+                return found
         return pd.Series([default] * len(series), index=series.index)
 
     frame = pd.DataFrame({
@@ -107,26 +113,40 @@ def per_patient(series: pd.DataFrame, cycle: int) -> pd.DataFrame:
         "modality": column("modality").astype(str),
         "protocol": column("protocol", "ccta_protocol", "scan_options").astype(str),
         "description": column("series_description").astype(str),
+        "family": column("series_family_description", "series_description").astype(str),
     })
-    text = (column("cardiac_phase_percentages").astype(str) + "|"
-            + column("phase_for_family").astype(str) + "|"
-            + column("series_description").astype(str) + "|"
-            + column("scan_options").astype(str))
-    frame["phases"] = [phases_in(value) for value in text]
-    inside = pd.to_numeric(column("n_temporal_positions", "temporal_positions_estimated",
-                                  "n_trigger_times", default=0), errors="coerce").fillna(0)
+    sources = ("cardiac_phase_percentages", "phase_for_family", "description_phase_percent",
+               "scan_options_phase_percent", "series_description", "scan_options")
+    found = {name: [phases_in(value) for value in column(name).tolist()] for name in sources}
+    print("   series carrying a readable phase, by field:")
+    for name in sources:
+        hits = sum(1 for value in found[name] if value)
+        print(f"     {name:<28} {hits:>7} of {len(series)}")
+    frame["phases"] = [set().union(*(found[name][row] for name in sources))
+                       for row in range(len(series))]
+
+    inside = pd.concat([
+        pd.to_numeric(column(name, default=0), errors="coerce").fillna(0)
+        for name in ("n_temporal_position_indices", "n_temporal_position_identifiers",
+                     "n_trigger_times", "n_cardiac_phase_percentages",
+                     "reported_temporal_positions", "temporal_positions_estimated")
+    ], axis=1).max(axis=1)
     frame["inside_series"] = inside.astype(int)
 
     rows = []
     for (site, patient), group in frame.groupby(["site", "patient_id"], dropna=False):
         phases = set().union(*group["phases"]) if len(group) else set()
         within = int(group["inside_series"].max())
+        # phases of one acquisition, so a 60 % calcium scan plus a 70 % CCTA is not a cycle
+        same = max((len(set().union(*part["phases"])) for _, part in group.groupby("family")),
+                   default=0)
         total = max(len(phases), within)
         rows.append({
             "site": site,
             "patient_id": patient,
             "series": len(group),
             "distinct_phases": len(phases),
+            "phases_same_acquisition": same,
             "max_phases_in_one_series": within,
             "phases": ", ".join(str(value) for value in sorted(phases)),
             "time_resolved": total >= 2,
@@ -142,6 +162,8 @@ def by_site(patients: pd.DataFrame, cycle: int) -> pd.DataFrame:
         patients=("patient_id", "nunique"),
         series=("series", "sum"),
         one_phase=("distinct_phases", lambda values: int((values <= 1).sum())),
+        same_acquisition_2plus=("phases_same_acquisition",
+                                lambda values: int((values >= 2).sum())),
         two_phases=("distinct_phases", lambda values: int((values == 2).sum())),
         three_or_four=("distinct_phases", lambda values: int(values.between(3, 4).sum())),
         cycle=("cycle", "sum"),
@@ -177,6 +199,10 @@ def main(argv=None) -> None:
           f" ({100 * patients['cycle'].mean():.1f} %)")
     print(f"   true 4D series (several phases in one series) "
           f"{int(patients['four_d_series'].sum())}")
+    print(f"   2 or more phases of the same acquisition "
+          f"{int((patients['phases_same_acquisition'] >= 2).sum())}")
+    print(f"   {args.cycle}+ phases of the same acquisition "
+          f"{int((patients['phases_same_acquisition'] >= args.cycle).sum())}")
     print("\n   phases per patient:")
     for _, row in histogram.iterrows():
         print(f"     {int(row['distinct_phases']):>3} phases  {int(row['patients']):>6} patients")
