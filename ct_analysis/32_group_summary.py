@@ -94,7 +94,8 @@ def compartment_of(name: str) -> str:
 def read_features(args: argparse.Namespace) -> pd.DataFrame:
     """Every radiomics workbook plus the measurement workbook, joined on patient_id."""
     paths = ([Path(item.strip()) for item in args.tables.split(",") if item.strip()]
-             or sorted(args.output.glob("radiomic_features*.xlsx")))
+             or sorted(args.output.glob("radiomic_features*.xlsx"),
+                       key=lambda path: -path.stat().st_size))  # the richest workbook first
     paths = [args.groups] + [path for path in paths if path != args.groups]
     merged = None
     for path in paths:
@@ -102,18 +103,22 @@ def read_features(args: argparse.Namespace) -> pd.DataFrame:
             continue
         table = pd.read_excel(path, sheet_name="Features")
         table.columns = [str(name).strip() for name in table.columns]
+        table = table.loc[:, ~table.columns.duplicated()]
         table["patient_id"] = table["patient_id"].astype(str)
         if "status" in table.columns:
             table = table[table["status"].astype(str) == "ok"]
         keep = ["patient_id"] + [name for name in table.columns
                                  if name != "patient_id" and pd.api.types.is_numeric_dtype(table[name])]
-        print(f"  {path.name}: {len(table)} patients, {len(keep) - 1} numbers")
-        table = table[keep]
-        merged = table if merged is None else merged.merge(
-            table, on="patient_id", how="inner", suffixes=("", "_dup"))
+        if merged is not None:  # a column already read keeps its first value, no duplicates
+            keep = ["patient_id"] + [name for name in keep[1:] if name not in merged.columns]
+        print(f"  {path.name}: {len(table)} patients, {len(keep) - 1} new numbers")
+        if len(keep) == 1:
+            continue
+        table = table.loc[:, keep].drop_duplicates(subset="patient_id")
+        merged = table if merged is None else merged.merge(table, on="patient_id", how="inner")
     if merged is None:
         raise SystemExit(f"no workbook found in {args.output}")
-    return merged.loc[:, ~merged.columns.str.endswith("_dup")]
+    return merged
 
 
 def read_scores(folder: Path, cases: list) -> dict:

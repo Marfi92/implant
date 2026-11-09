@@ -33,7 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon, Rectangle
 
 SEG = Path(r"W:\SCAPIS_seg_lowres_3mm_noncontrast")
 ANALYSIS = SEG / "analysis" / "results"
@@ -70,79 +70,144 @@ def arrow(axis, start, end, style="-|>", colour="#444444", dashed=False):
                                    connectionstyle="arc3,rad=0.0"))
 
 
+def slab(axis, x, y, width, height, colour, depth=0.012, label="", under="", size=7.4):
+    """A box drawn as a small 3D slab, so a stack of them reads as a feature map."""
+    axis.add_patch(Polygon([(x, y + height), (x + depth, y + height + depth * 1.6),
+                            (x + width + depth, y + height + depth * 1.6), (x + width, y + height)],
+                           closed=True, facecolor=colour, edgecolor="#5a5a5a", linewidth=0.7))
+    axis.add_patch(Polygon([(x + width, y), (x + width + depth, y + depth * 1.6),
+                            (x + width + depth, y + height + depth * 1.6), (x + width, y + height)],
+                           closed=True, facecolor=colour, edgecolor="#5a5a5a", linewidth=0.7,
+                           alpha=0.75))
+    axis.add_patch(Rectangle((x, y), width, height, facecolor=colour, edgecolor="#5a5a5a",
+                             linewidth=0.8))
+    if label:
+        axis.text(x + width / 2, y + height / 2, label, ha="center", va="center", fontsize=size)
+    if under:
+        axis.text(x + width / 2, y - 0.022, under, ha="center", va="top", fontsize=6.8,
+                  color="#444444")
+
+
+def tokens(axis, x, y, count, size, colour, gap=0.004):
+    """A row of small squares, used for the latent code and the attention tokens."""
+    for index in range(count):
+        axis.add_patch(Rectangle((x + index * (size + gap), y), size, size, facecolor=colour,
+                                 edgecolor="#5a5a5a", linewidth=0.6))
+    return x + count * (size + gap) - gap
+
+
 def figure_method(args, folder: Path) -> None:
-    """One page that shows every part of the model and how the blocks are formed."""
-    figure, axis = plt.subplots(figsize=(13.2, 7.4))
+    """The network on one page: tensors, encoder levels, attention, latent, heads, blocks."""
+    figure, axis = plt.subplots(figsize=(15.0, 8.4))
     axis.set_xlim(0, 1)
     axis.set_ylim(0, 1)
     axis.axis("off")
-    axis.set_title("Attenuation radiomics, learnt representation and radiomics of the learnt "
-                   "feature maps for atrial fibrillation on non-contrast CT",
-                   fontsize=11.5, fontweight="bold", y=1.02)
+    axis.set_title("Self-supervised encoder on peri-atrial CT, and radiomics of its latent "
+                   "feature maps, for atrial fibrillation",
+                   fontsize=12.5, fontweight="bold", y=1.0)
 
-    box(axis, 0.01, 0.74, 0.15, 0.16,
-        f"Non-contrast CT\n3 mm, {args.analysed} patients\n+ nnU-Net masks\nleft atrium and\n"
-        "pericardial fat", BLUE, bold=True)
-    box(axis, 0.01, 0.50, 0.15, 0.16,
-        f"Rim crop\ncentred on the atrium\n{args.box} voxels\nat {args.spacing} mm\n"
-        "channel 1 HU window\nchannel 2 labels", BLUE)
-    box(axis, 0.01, 0.24, 0.15, 0.18,
-        "Shell weight\nw = 1 inside the atrial\nwall and the fat within\n10 mm, 0.05 elsewhere\n"
-        "so the loss is paid\nwhere LA-EAT sits", SAND)
-    arrow(axis, (0.085, 0.74), (0.085, 0.665))
-    arrow(axis, (0.085, 0.50), (0.085, 0.425))
+    depth, rows, columns = [int(v) for v in str(args.box).split(",")]
+    shapes, width_now = [], 24
+    for level in range(4):
+        shapes.append((width_now, depth // 2 ** (level + 1), rows // 2 ** (level + 1),
+                       columns // 2 ** (level + 1)))
+        width_now *= 2
 
-    box(axis, 0.20, 0.52, 0.16, 0.26,
-        "Encoder\n4 levels, 3D conv\nwidth 24, stride 2\n\nattention pooling\nper level, not mean\n"
-        "latent code, 96", GREEN, bold=True)
-    arrow(axis, (0.16, 0.58), (0.20, 0.62))
-    arrow(axis, (0.16, 0.33), (0.20, 0.56), dashed=True)
+    # input ------------------------------------------------------------------
+    axis.text(0.055, 0.955, "input", fontsize=9, fontweight="bold", ha="center")
+    slab(axis, 0.015, 0.74, 0.085, 0.145, BLUE, depth=0.016,
+         label=f"rim crop\n2 x {depth} x {rows} x {columns}\nat {args.spacing} mm",
+         under="channel 1 HU window\nchannel 2 LA and fat labels")
+    slab(axis, 0.015, 0.545, 0.085, 0.085, SAND, depth=0.016, label="shell weight\nw = 1 / 0.05",
+         under="atrial wall and the fat\nwithin 10 mm")
+    arrow(axis, (0.058, 0.74), (0.058, 0.66))
 
-    box(axis, 0.40, 0.80, 0.17, 0.13,
-        "Masked reconstruction\n40 % of blocks hidden\nshell-weighted L1", GREY)
-    box(axis, 0.40, 0.63, 0.17, 0.13,
-        "SimSiam\ntwo augmented views\nof the same patient", GREY)
-    box(axis, 0.40, 0.46, 0.17, 0.13,
-        "Distillation\npredict the four\nhandcrafted features", GREY)
-    for height in (0.865, 0.695, 0.525):
-        arrow(axis, (0.36, 0.65), (0.40, height))
-    axis.text(0.485, 0.41, "pretraining, no labels, inside the training fold only",
-              ha="center", fontsize=8.2, style="italic")
+    # encoder ----------------------------------------------------------------
+    axis.text(0.255, 0.955, "encoder, 3D convolutional, stride 2 per level", fontsize=9,
+              fontweight="bold", ha="center")
+    left, top, height = 0.135, 0.885, 0.145
+    for level, (channels, d, r, c) in enumerate(shapes):
+        scale = 1.0 - 0.17 * level
+        slab(axis, left, top - height * scale, 0.052, height * scale, GREEN, depth=0.013,
+             label=f"L{level + 1}\n{channels}ch", under=f"{d}x{r}x{c}", size=7.2)
+        if level:
+            arrow(axis, (left - 0.016, 0.80), (left - 0.002, 0.80))
+        left += 0.068
+    arrow(axis, (0.10, 0.81), (0.133, 0.81))
+    arrow(axis, (0.10, 0.588), (0.133, 0.76), dashed=True)
+    axis.text(0.255, 0.615, "two 3x3x3 convolutions, instance norm, GELU, residual",
+              fontsize=7.6, ha="center", color="#444444", style="italic")
 
-    box(axis, 0.63, 0.78, 0.17, 0.15,
-        "A  attenuation radiomics\nLA IQR, LA surface area,\nLA-EAT flatness,\nfat median HU", RED,
-        bold=True)
-    box(axis, 0.63, 0.58, 0.17, 0.17,
-        "B  latent radiomics\nevery channel of every\nlevel as a small 3D image;\nmean, SD, energy,\n"
-        "gradient inside atrium,\nfat and LA-EAT rim", RED, bold=True)
-    box(axis, 0.63, 0.38, 0.17, 0.17,
-        "C  residual latent\nblock A regressed out\nof the code inside the\ntraining fold, so C is\n"
-        "what radiomics cannot\nexpress", RED, bold=True)
-    arrow(axis, (0.57, 0.60), (0.63, 0.66))
-    arrow(axis, (0.57, 0.55), (0.63, 0.46))
-    axis.annotate("", xy=(0.715, 0.93), xytext=(0.085, 0.90),
-                  arrowprops=dict(arrowstyle="-|>", color="#777777", linewidth=0.9,
-                                  connectionstyle="arc3,rad=-0.18"))
-    axis.text(0.40, 0.985, "handcrafted features from the same masks", fontsize=8, ha="center",
-              color="#555555")
+    # attention pooling ------------------------------------------------------
+    box(axis, 0.135, 0.455, 0.25, 0.12,
+        "attention pooling at every level\nq . k over the voxel tokens of the level, softmax,\n"
+        "weighted sum, so the readout is where the model looks,\nnot the mean of the volume",
+        "#e5ddf2", size=8.2)
+    for index in range(4):
+        arrow(axis, (0.161 + 0.068 * index, 0.70 - 0.025 * index), (0.20 + 0.04 * index, 0.575))
 
-    box(axis, 0.84, 0.55, 0.15, 0.26,
-        "Logistic model\nper block and per\ncombination\nA, B, C, A+B,\nA+C, A+B+C\n\n"
-        "DeLong against A", GREEN, bold=True)
-    for height in (0.855, 0.665, 0.465):
-        axis.annotate("", xy=(0.84, 0.68), xytext=(0.80, height),
+    # latent code ------------------------------------------------------------
+    axis.text(0.465, 0.955, "latent", fontsize=9, fontweight="bold", ha="center")
+    right = tokens(axis, 0.415, 0.80, 12, 0.0145, "#b9c7e8")
+    axis.text(0.465, 0.775, f"latent code, {96} values", fontsize=7.6, ha="center")
+    arrow(axis, (0.385, 0.515), (0.415, 0.72))
+    for index in range(4):
+        slab(axis, 0.418 + 0.006 * index, 0.60 + 0.006 * index, 0.075, 0.085, "#cdd9ef",
+             depth=0.010, label="" if index < 3 else "latent\nfeature maps", size=7.0)
+    axis.text(0.465, 0.575, "every channel of every level\nis itself a small 3D image",
+              fontsize=7.4, ha="center", va="top", color="#444444")
+
+    # pretraining heads ------------------------------------------------------
+    axis.text(0.635, 0.955, "pretraining, no labels, inside the training fold", fontsize=9,
+              fontweight="bold", ha="center")
+    box(axis, 0.545, 0.845, 0.185, 0.085,
+        "masked reconstruction\n40 % of blocks hidden, decoder rebuilds them,\n"
+        "L1 weighted by the shell", GREY, size=7.8)
+    box(axis, 0.545, 0.735, 0.185, 0.095,
+        "self-distillation, SimSiam / DINO style\ntwo augmented views, student predicts the\n"
+        "stop-gradient teacher of the other view", GREY, size=7.8)
+    box(axis, 0.545, 0.635, 0.185, 0.085,
+        "feature distillation\npredict the four handcrafted features,\nso the code must contain them",
+        GREY, size=7.8)
+    for height_at in (0.887, 0.782, 0.677):
+        arrow(axis, (0.50, 0.81), (0.545, height_at))
+
+    # the three blocks -------------------------------------------------------
+    axis.text(0.845, 0.955, "feature blocks and evaluation", fontsize=9, fontweight="bold",
+              ha="center")
+    box(axis, 0.762, 0.835, 0.17, 0.10,
+        "A  attenuation radiomics\nLA HU IQR, LA surface area,\nLA-EAT flatness, fat median HU",
+        RED, size=8.0, bold=True)
+    box(axis, 0.762, 0.705, 0.17, 0.115,
+        "B  latent radiomics\nmean, SD, energy and gradient of\nevery latent channel inside the\n"
+        "atrium, the fat and the LA-EAT rim", RED, size=8.0, bold=True)
+    box(axis, 0.762, 0.575, 0.17, 0.115,
+        "C  residual latent\nblock A regressed out of the code\ninside the training fold, so C is\n"
+        "what the radiomics cannot express", RED, size=8.0, bold=True)
+    axis.annotate("", xy=(0.80, 0.835), xytext=(0.10, 0.90),
+                  arrowprops=dict(arrowstyle="-|>", color="#888888", linewidth=0.9,
+                                  connectionstyle="arc3,rad=-0.14"))
+    axis.text(0.44, 0.995, "the same masks, handcrafted", fontsize=7.6, ha="center",
+              color="#666666")
+    arrow(axis, (0.50, 0.645), (0.762, 0.762))
+    arrow(axis, (0.50, 0.615), (0.762, 0.632))
+
+    box(axis, 0.762, 0.40, 0.17, 0.13,
+        "logistic model per block\nA, B, C, A+B, A+C, A+B+C\n\nDeLong against A",
+        GREEN, size=8.4, bold=True)
+    for height_at in (0.835, 0.705, 0.575):
+        axis.annotate("", xy=(0.847, 0.53), xytext=(0.847, height_at),
                       arrowprops=dict(arrowstyle="-|>", color="#444444", linewidth=0.9,
-                                      connectionstyle="arc3,rad=0.12"))
+                                      connectionstyle="arc3,rad=0.0"))
+    box(axis, 0.762, 0.255, 0.17, 0.10,
+        f"{args.group} against control\nAUC, repeated 5-fold,\nseed averaged, test time augmented",
+        SAND, size=8.2)
+    arrow(axis, (0.847, 0.40), (0.847, 0.355))
 
-    box(axis, 0.84, 0.28, 0.15, 0.20,
-        f"{args.group} against control\nAUC, 5-fold\nrepeated, seed averaged\ntest time augmentation",
-        SAND)
-    arrow(axis, (0.915, 0.55), (0.915, 0.48))
-
-    box(axis, 0.20, 0.06, 0.60, 0.13,
-        "Fold safety: the split is made first; cropping, pretraining, PCA, the orthogonalisation of C, "
-        "the feature screen\nand every classifier are fitted on the training patients only, so no test "
-        "patient is seen before it is scored.", GREY, size=8.5)
+    box(axis, 0.10, 0.07, 0.62, 0.10,
+        "Fold safety: the split is made first, then cropping, pretraining, PCA, the "
+        "orthogonalisation of C,\nthe feature screen and every classifier are fitted on the "
+        "training patients only.", GREY, size=8.4)
     plt.tight_layout()
     plt.savefig(folder / "figure1_method.png", dpi=240)
     plt.close()
