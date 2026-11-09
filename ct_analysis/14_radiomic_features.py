@@ -94,6 +94,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Laplacian of Gaussian sigmas in mm, used when log is among the filters",
     )
     parser.add_argument(
+        "--compartments",
+        default=",".join(COMPARTMENTS),
+        help="which regions to extract, e.g. la. One region at a time with --name "
+        "keeps each workbook small and lets a crash cost only that region",
+    )
+    parser.add_argument(
         "--name",
         default="",
         help="workbook name, default radiomic_features.xlsx or _full with --full",
@@ -307,7 +313,7 @@ def measure_one(
         "patient_id": helpers.patient_of(image_path.name),
         "voxel_ml": round(millilitre, 5),
     }
-    for name in COMPARTMENTS:
+    for name in getattr(args, "regions", COMPARTMENTS):
         mask = arrays.get(name)
         if mask is None or not mask.any():
             continue
@@ -332,8 +338,9 @@ def measure_one(
 def workbook_name(args: argparse.Namespace) -> str:
     if args.name:
         return args.name
+    part = "" if set(args.regions) == set(COMPARTMENTS) else "_" + "_".join(args.regions)
     if args.filters:
-        return "radiomic_features_filters.xlsx"
+        return f"radiomic_features_filters{part}.xlsx"
     if args.full:
         return "radiomic_features_full.xlsx"
     return "radiomic_features.xlsx"
@@ -365,6 +372,10 @@ def append_row(path: Path, row: dict, first: bool) -> None:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    args.regions = [name.strip() for name in args.compartments.split(",") if name.strip()]
+    unknown = [name for name in args.regions if name not in COMPARTMENTS]
+    if unknown:
+        raise SystemExit(f"unknown compartment {unknown}, pick from {COMPARTMENTS}")
     args.image_types = image_types(args)
     if args.filters and not args.full:
         raise SystemExit("--filters only makes sense together with --full")
