@@ -89,7 +89,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--measurements", type=Path, default=ANALYSIS / "fat_la_features.xlsx")
     parser.add_argument("--radiomics", type=Path, default=ANALYSIS / "radiomic_features_full.xlsx")
     parser.add_argument("--output", type=Path, default=ANALYSIS)
-    parser.add_argument("--group", default="AF", help="AF, HF or stroke")
+    parser.add_argument("--group", default="AF",
+                        help="AF, HF or stroke, or several pooled into one case group, "
+                             "e.g. --group AF,HF,stroke for diseased against control")
 
     parser.add_argument("--box", default="48,128,128", help="z,y,x voxels of the resampled box")
     parser.add_argument("--spacing", type=float, default=1.5, help="mm per voxel of the box, the fine resolution")
@@ -124,7 +126,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     step = 2 ** args.levels
     if len(args.box) != 3 or any(size % step for size in args.box):
         raise SystemExit(f"--box {args.box} must be three sizes, each divisible by {step}")
+    args.cases = case_labels(args.group)
+    args.tag = "_".join(args.cases)  # for file names and titles when groups are pooled
     return args
+
+
+def case_labels(group: str) -> list:
+    """One disease, or several pooled: --group AF,HF,stroke is diseased against control."""
+    return [name.strip() for name in str(group).split(",") if name.strip()]
 
 
 def signature(args) -> str:
@@ -738,12 +747,12 @@ def plot_latent(latent, target, args, folder: Path) -> None:
         points = PCA(n_components=2, random_state=args.seed).fit_transform(scaled)
         name = "principal component"
     plt.figure(figsize=(6.5, 6))
-    for value, colour, label in ((0, "#5dade2", "control"), (1, "#e74c3c", args.group)):
+    for value, colour, label in ((0, "#5dade2", "control"), (1, "#e74c3c", args.tag)):
         plt.scatter(points[target == value, 0], points[target == value, 1], s=12, alpha=0.6, c=colour, label=label)
     plt.legend()
     plt.xlabel(f"{name} 1")
     plt.ylabel(f"{name} 2")
-    plt.title(f"Held out rim representation, {args.group} against control")
+    plt.title(f"Held out rim representation, {args.tag} against control")
     plt.tight_layout()
     plt.savefig(folder / "02_latent_space.png", dpi=200)
     plt.close()
@@ -814,15 +823,16 @@ def main(argv=None) -> None:
 
     groups = pd.read_excel(args.groups, sheet_name="Features")
     groups.columns = [str(name).strip() for name in groups.columns]
-    groups = groups[groups["group"].isin([args.group, "control"])]
+    cases = args.cases
+    groups = groups[groups["group"].isin([*cases, "control"])]
     wanted = groups["patient_id"].astype(str).tolist()
-    print(f"1. {args.group} {int((groups['group'] == args.group).sum())} "
+    print(f"1. {'+'.join(cases)} {int(groups['group'].isin(cases).sum())} "
           f"against control {int((groups['group'] == 'control').sum())}")
 
     crops, ids = build_crops(args, wanted, folder)
     label_of = dict(zip(groups["patient_id"].astype(str), groups["group"]))
-    target = np.array([1 if label_of[name] == args.group else 0 for name in ids])
-    print(f"2. {len(ids)} patients, {int(target.sum())} {args.group}, box {args.box} at {args.spacing} mm")
+    target = np.array([1 if label_of[name] in cases else 0 for name in ids])
+    print(f"2. {len(ids)} patients, {int(target.sum())} {args.tag}, box {args.box} at {args.spacing} mm")
     if not args.limit and len(ids) < 0.9 * len(wanted):
         print(f"   WARNING: {len(wanted)} patients are in the workbook but only {len(ids)} are cropped,"
               " let the cropping finish before reading any AUC below")
@@ -849,7 +859,8 @@ def main(argv=None) -> None:
             holder[1][test] += 1.0
 
     for repeat, number, train, test in splits_of(crops, target, args):
-        key = f"{signature(args)} k{args.folds} r{repeat}/{args.repeats} s{args.seeds} tta{args.tta} n{len(target)} fold{number}"
+        key = (f"{signature(args)} {args.tag} k{args.folds} r{repeat}/{args.repeats}"
+               f" s{args.seeds} tta{args.tta} n{len(target)} fold{number}")
         stored = journal.get(key)
         if stored:
             latent_out[test] = np.array(stored["latent"])
@@ -957,17 +968,17 @@ def main(argv=None) -> None:
                           "case": target, "rim_score": image_scores})
     for name in sorted(probe_scores):
         table[f"probe_{name.replace(' ', '_')}"] = probe_scores[name]
-    table.to_csv(folder / f"scores_{args.group}.csv", index=False)
+    table.to_csv(folder / f"scores_{args.tag}.csv", index=False)
 
     if not args.no_plots:
-        plot_roc(curves, plots, args.group)
+        plot_roc(curves, plots, args.tag)
         plot_latent(latent_out, target, args, plots)
         plot_shell(crops, args, plots)
         if model is not None and device is not None:
-            plot_attention(model, device, crops, args, plots, args.group)
+            plot_attention(model, device, crops, args, plots, args.tag)
         print(f"\nPlots : {plots}")
 
-    workbook = folder / "rim.xlsx"
+    workbook = folder / (f"rim_{args.tag}.xlsx" if args.tag != "AF" else "rim.xlsx")
     with pd.ExcelWriter(workbook) as writer:
         pd.DataFrame(rows + reference_rows).to_excel(writer, sheet_name="AUC", index=False)
         pd.DataFrame(fold_aucs).to_excel(writer, sheet_name="Folds", index=False)

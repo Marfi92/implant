@@ -294,9 +294,10 @@ def main(argv=None) -> None:
 
     groups = pd.read_excel(args.groups, sheet_name="Features")
     groups.columns = [str(name).strip() for name in groups.columns]
-    groups = groups[groups["group"].isin([args.group, "control"])]
+    cases = args.cases
+    groups = groups[groups["group"].isin([*cases, "control"])]
     wanted = groups["patient_id"].astype(str).tolist()
-    print(f"1. {args.group} {int((groups['group'] == args.group).sum())} "
+    print(f"1. {'+'.join(cases)} {int(groups['group'].isin(cases).sum())} "
           f"against control {int((groups['group'] == 'control').sum())}")
 
     if args.crops is None:
@@ -306,8 +307,8 @@ def main(argv=None) -> None:
             print(f"   reusing the script 29 crops, {shared}")
     crops, ids = RIM.build_crops(args, wanted, folder)
     label_of = dict(zip(groups["patient_id"].astype(str), groups["group"]))
-    target = np.array([1 if label_of[name] == args.group else 0 for name in ids])
-    print(f"2. {len(ids)} patients, {int(target.sum())} {args.group}, box {args.box} at {args.spacing} mm")
+    target = np.array([1 if label_of[name] in cases else 0 for name in ids])
+    print(f"2. {len(ids)} patients, {int(target.sum())} {args.tag}, box {args.box} at {args.spacing} mm")
     if target.sum() < 10 or (len(target) - target.sum()) < 10:
         raise SystemExit("too few patients of one class to cross-validate")
 
@@ -328,7 +329,7 @@ def main(argv=None) -> None:
 
     print(f"3. fold-safe, {args.repeats} x {args.folds} folds, encoder pretrained inside each training fold")
     for repeat, number, train, test in RIM.splits_of(crops, target, args):
-        key = (f"{RIM.signature(args)} k{args.folds} r{repeat}/{args.repeats} n{len(target)}"
+        key = (f"{RIM.signature(args)} {args.tag} k{args.folds} r{repeat}/{args.repeats} n{len(target)}"
                f" pca{args.components} C{args.regularisation} fold{number}")
         stored = journal.get(key)
         if stored:
@@ -409,15 +410,15 @@ def main(argv=None) -> None:
     table = pd.DataFrame({"patient_id": ids, "group": [label_of[name] for name in ids], "case": target})
     for name in blocks:
         table[name.replace(" ", "_").replace("+", "plus")] = pooled[name]
-    table.to_csv(folder / f"scores_{args.group}.csv", index=False)
+    table.to_csv(folder / f"scores_{args.tag}.csv", index=False)
 
     importance = importance_of(keep_values, keep_names, target) if keep_values is not None else {}
     if not args.no_plots:
-        plot_roc(curves, plots, args.group)
-        plot_where(importance, plots, args.group)
+        plot_roc(curves, plots, args.tag)
+        plot_where(importance, plots, args.tag)
         print(f"Plots : {plots}")
 
-    workbook = folder / "latent.xlsx"
+    workbook = folder / (f"latent_{args.tag}.xlsx" if args.tag != "AF" else "latent.xlsx")
     with pd.ExcelWriter(workbook) as writer:
         pd.DataFrame(rows).to_excel(writer, sheet_name="AUC", index=False)
         pd.DataFrame(per_fold).to_excel(writer, sheet_name="Folds", index=False)

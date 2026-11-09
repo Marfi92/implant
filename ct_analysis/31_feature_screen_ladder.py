@@ -74,7 +74,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--groups", type=Path, default=ANALYSIS / "fat_la_features.xlsx")
     parser.add_argument("--output", type=Path, default=ANALYSIS)
-    parser.add_argument("--group", default="AF", help="AF, HF or stroke")
+    parser.add_argument("--group", default="AF",
+                        help="AF, HF or stroke, or several pooled into one case group, "
+                             "e.g. --group AF,HF,stroke for diseased against control")
     parser.add_argument("--keep", type=int, default=100, help="features kept per compartment")
     parser.add_argument(
         "--max-correlation",
@@ -139,7 +141,8 @@ def labels_of(args: argparse.Namespace, table: pd.DataFrame) -> tuple:
     label_of = dict(zip(groups["patient_id"], groups["group"]))
     wanted = [name in label_of for name in table["patient_id"]]
     table = table[wanted].reset_index(drop=True)
-    target = np.array([1 if label_of[name] == args.group else 0 for name in table["patient_id"]])
+    cases = [name.strip() for name in str(args.group).split(",") if name.strip()]
+    target = np.array([1 if label_of[name] in cases else 0 for name in table["patient_id"]])
     keep = (target == 1) | np.array(
         [label_of[name] in ("control", "Control") for name in table["patient_id"]]
     )
@@ -387,7 +390,8 @@ def main(argv=None) -> None:
     for repeat in range(1, args.repeats + 1):
         splitter = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed + repeat)
         for number, (train, test) in enumerate(splitter.split(values, target), 1):
-            key = f"keep{args.keep} pairs{args.pairs} n{len(target)} f{len(names)} r{repeat} fold{number}"
+            key = (f"{args.group} keep{args.keep} pairs{args.pairs} n{len(target)}"
+                   f" f{len(names)} r{repeat} fold{number}")
             saved = journal.get(key)
             if saved is not None:
                 folds.append(saved)
@@ -438,7 +442,8 @@ def main(argv=None) -> None:
     for row in pairs.head(10).itertuples():
         print(f"   {row.test_auc:.4f}  {row.feature_a} + {row.feature_b}")
 
-    book = folder / "ladder.xlsx"
+    tag = args.group.replace(",", "_")
+    book = folder / (f"ladder_{tag}.xlsx" if tag != "AF" else "ladder.xlsx")
     with pd.ExcelWriter(book) as writer:
         single.head(args.report * 20).to_excel(writer, sheet_name="Single", index=False)
         kept.to_excel(writer, sheet_name="Kept", index=False)
