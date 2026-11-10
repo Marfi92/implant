@@ -261,6 +261,68 @@ def figure_results(args, folder: Path) -> bool:
     return True
 
 
+def figure_blocks(args, folder: Path) -> bool:
+    """Radiomics against the latent blocks, drawn from latent.xlsx alone.
+
+    Three panels: the AUC of every block with its DeLong p against the radiomics,
+    which latent radiomics carry the separation, and the two scores against each
+    other, which shows whether the latent block is complementary or a copy.
+    """
+    book = args.output / "latent" / (
+        "latent.xlsx" if args.group == "AF" else f"latent_{args.group.replace(',', '_')}.xlsx")
+    if not book.exists():
+        print(f"   figure6 skipped, run 30_latent_radiomics.py first ({book} missing)")
+        return False
+    sheets = pd.read_excel(book, sheet_name=None)
+    auc = sheets["AUC"]
+    figure, axes = plt.subplots(1, 3, figsize=(15.5, 4.6))
+
+    order = auc.sort_values("auc")
+    bars = axes[0].barh(order["block"], order["auc"],
+                        xerr=pd.to_numeric(order.get("sd"), errors="coerce"),
+                        color=["#c44e52" if str(name).startswith("A ") else "#4c78a8"
+                               for name in order["block"]], height=0.66, capsize=3)
+    for bar, (_, row) in zip(bars, order.iterrows()):
+        note = f"{row['auc']:.3f}"
+        if str(row.get("delong_p_vs_A", "")) not in {"", "nan"}:
+            note += f"  p={float(row['delong_p_vs_A']):.3f}"
+        shift = float(pd.to_numeric(row.get("sd"), errors="coerce") or 0) + 0.014
+        axes[0].text(row["auc"] + shift, bar.get_y() + bar.get_height() / 2, note,
+                     va="center", fontsize=8)
+    axes[0].axvline(0.5, color="0.6", lw=0.8)
+    axes[0].set_xlim(0.45, min(1.02, order["auc"].max() + 0.16))
+    axes[0].set_xlabel("AUC, cross-validated")
+    axes[0].set_title("(a) attenuation radiomics against the latent blocks", fontsize=10, loc="left")
+
+    where = sheets.get("Latent_radiomics")
+    if where is not None and len(where):
+        top = where.head(15).iloc[::-1]
+        axes[1].barh(top["block"].astype(str), top["mean_abs_t"], color="#55a868", height=0.68)
+        axes[1].set_xlabel("mean |t| between cases and controls")
+        axes[1].tick_params(axis="y", labelsize=7)
+    axes[1].set_title("(b) which latent radiomics separate the cases", fontsize=10, loc="left")
+
+    scores = sheets.get("Scores")
+    first = "A_attenuation_radiomics"
+    second = next((name for name in ("B_latent_radiomics", "C_residual_latent")
+                   if scores is not None and name in scores.columns), None)
+    if scores is not None and first in scores.columns and second:
+        for value, colour, name in ((0, "#9aa7b8", "control"), (1, "#c44e52", "case")):
+            part = scores[scores["case"] == value]
+            axes[2].scatter(part[first], part[second], s=9, alpha=0.65, c=colour, label=name)
+        axes[2].set_xlabel("block A score, attenuation radiomics")
+        axes[2].set_ylabel(f"{second.split('_')[0]} score, latent")
+        axes[2].legend(fontsize=8, frameon=False)
+    axes[2].set_title("(c) the two scores against each other", fontsize=10, loc="left")
+
+    figure.suptitle("The learnt latent representation against conventional radiomics",
+                    fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(folder / "figure6_blocks.png", dpi=240)
+    plt.close()
+    return True
+
+
 def tile(paths: list, titles: list, out: Path, title: str, columns: int = 2) -> bool:
     have = [(path, name) for path, name in zip(paths, titles) if path.exists()]
     if not have:
@@ -295,6 +357,7 @@ def main(argv=None) -> None:
     figure_flow(args, folder)
     print("2. the result figures, from what is already on disk")
     figure_results(args, folder)
+    figure_blocks(args, folder)
     tile([rim / "04_shell.png", rim / "03_attention.png",
           rim / "02_latent_space.png", latent / "02_where.png"],
          ["the shell the loss is weighted by", "where the encoder attends",
