@@ -17,6 +17,9 @@ the AF signal sits. Five changes here, all of them in the same run:
     4  distillation: the pretrained code also has to predict the four hand made
        features, standardised inside the training fold, so it is forced to carry
        at least what the 0.788 model carries. No AF label is used for this.
+       --distil-targets all widens it to every radiomic in the workbook, and
+       --denovo removes it, so the code is learnt from the images alone and is
+       written to its own workbook (rim_AF_denovo.xlsx).
     5  SimSiam contrastive pretraining of two augmented views, added to a masked
        reconstruction loss, which beats reconstruction alone at this sample size.
 
@@ -107,7 +110,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--mask-fraction", type=float, default=0.4, help="share of blocks hidden from the decoder")
     parser.add_argument("--simsiam", type=float, default=1.0, help="weight of the contrastive term")
-    parser.add_argument("--distil", type=float, default=1.0, help="weight of the four feature distillation")
+    parser.add_argument("--distil", type=float, default=1.0, help="weight of the feature distillation")
+    parser.add_argument("--distil-targets", default="four", choices=("four", "all", "none"),
+                        help="what the code is asked to predict while it pretrains: the four hand "
+                             "made features, every radiomic in the workbook, or nothing (de novo)")
+    parser.add_argument("--distil-count", type=int, default=64,
+                        help="how many radiomics to distil when --distil-targets all")
+    parser.add_argument("--denovo", action="store_true",
+                        help="de novo: no handcrafted target at all, the code comes from the "
+                             "images only, written to its own workbook")
 
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=1, help="repeated k-fold, each with a new split")
@@ -128,6 +139,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         raise SystemExit(f"--box {args.box} must be three sizes, each divisible by {step}")
     args.cases = case_labels(args.group)
     args.tag = "_".join(args.cases)  # for file names and titles when groups are pooled
+    if args.denovo:
+        args.distil_targets = "none"
+    if args.distil_targets == "none":
+        args.distil = 0.0
+        args.tag += "_denovo"      # so a de novo run never overwrites the distilled one
+    elif args.distil_targets == "all":
+        args.tag += "_radiomic"
+    args.distil_dim = len(BEST_FOUR)
     return args
 
 
@@ -140,7 +159,8 @@ def signature(args) -> str:
     """Two runs share a checkpoint only when every number that shapes it matches."""
     return (f"{args.box}@{args.spacing}mm rim{args.rim_mm} bg{args.background} L{args.levels}"
             f" w{args.width} z{args.latent} pre{args.pretrain_epochs} ft{args.finetune_epochs}"
-            f" mask{args.mask_fraction} sim{args.simsiam} dis{args.distil}")
+            f" mask{args.mask_fraction} sim{args.simsiam} dis{args.distil}"
+            f" on {args.distil_targets}")
 
 
 class Journal:
@@ -478,7 +498,7 @@ def build_network(args: argparse.Namespace):
                 nn.Linear(args.latent, 128), nn.BatchNorm1d(128), nn.LeakyReLU(0.01), nn.Linear(128, 128)
             )
             self.predictor = nn.Sequential(nn.Linear(128, 64), nn.LeakyReLU(0.01), nn.Linear(64, 128))
-            self.distil = nn.Linear(args.latent, len(BEST_FOUR))  # step 4, no label involved
+            self.distil = nn.Linear(args.latent, args.distil_dim)  # step 4, no label involved
             self.classifier = nn.Sequential(
                 nn.Linear(args.latent, 64), nn.LeakyReLU(0.01), nn.Dropout(0.3), nn.Linear(64, 1)
             )
@@ -696,9 +716,31 @@ def measurement_table(ids: list, args) -> pd.DataFrame | None:
 
 
 def distillation_targets(merged, args) -> np.ndarray | None:
-    """The four hand made features as regression targets, NaN where unknown."""
-    if merged is None:
+    """Regression targets for the pretraining head, NaN where unknown.
+
+    four: the established model, so the code must contain it.
+    all : every radiomic in the workbook, the widest handcrafted prior.
+    none: de novo, the code is learnt from the images alone.
+    The choice uses no group label, so it stays fold safe.
+    """
+    if merged is None or args.distil_targets == "none":
+        if args.distil_targets == "none":
+            print("   de novo, no handcrafted target during pretraining")
         return None
+    if args.distil_targets == "all":
+        numbers = merged.apply(pd.to_numeric, errors="coerce")
+        numbers = numbers.loc[:, numbers.notna().mean() > 0.9]
+        numbers = numbers.loc[:, numbers.std() > 1e-9]
+        # the most variable radiomics, so the head is not spent on near constant ones
+        spread = (numbers.std() / numbers.std().max()).sort_values(ascending=False)
+        keep = list(dict.fromkeys(BEST_FOUR + list(spread.index)))
+        keep = [name for name in keep if name in numbers.columns][: max(args.distil_count, 4)]
+        if not keep:
+            print("   distillation skipped, no usable radiomics in the workbook")
+            return None
+        print(f"   distilling {len(keep)} radiomics into the code while it pretrains")
+        args.distil_dim = len(keep)
+        return numbers[keep].to_numpy(dtype=float)
     have = [name for name in BEST_FOUR if name in merged.columns]
     if not have:
         print("   distillation skipped, the four features are not in the workbook")
@@ -706,6 +748,7 @@ def distillation_targets(merged, args) -> np.ndarray | None:
     values = merged[have].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     out = np.full((len(values), len(BEST_FOUR)), np.nan)
     out[:, : len(have)] = values
+    args.distil_dim = len(BEST_FOUR)
     return out
 
 
