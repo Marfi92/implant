@@ -344,6 +344,106 @@ def tile(paths: list, titles: list, out: Path, title: str, columns: int = 2) -> 
     return True
 
 
+def figure_rim(args, folder: Path) -> None:
+    """The rim encoder-decoder on one page, with its own AUC bars under it.
+
+    Top: the crop, the four encoder levels with their tensor sizes, the latent
+    code, the decoder that rebuilds the shell, and the two auxiliary heads.
+    Bottom: what every readout of that encoder scored, from rim.xlsx, against
+    LA volume and the four handcrafted features.
+    """
+    figure = plt.figure(figsize=(14.0, 9.6))
+    grid = figure.add_gridspec(2, 1, height_ratios=[1.45, 1.0], hspace=0.14)
+    axis = figure.add_subplot(grid[0])
+    axis.set_xlim(0, 1)
+    axis.set_ylim(0, 1)
+    axis.axis("off")
+    axis.set_title("Encoder-decoder on the peri-atrial rim, and the latent representation "
+                   "it learns", fontsize=12.5, fontweight="bold", y=1.02)
+
+    depth, rows_, columns_ = [int(v) for v in str(args.box).split(",")]
+    shapes, channels = [], 24
+    for level in range(4):
+        shapes.append((channels, depth // 2 ** (level + 1), rows_ // 2 ** (level + 1),
+                       columns_ // 2 ** (level + 1)))
+        channels *= 2
+
+    slab(axis, 0.012, 0.42, 0.10, 0.34, BLUE, depth=0.018,
+         label=f"rim crop\n2 x {depth} x {rows_} x {columns_}\nat {args.spacing} mm",
+         under="HU and the LA / fat labels,\nthe atrium at the centre", size=8.0)
+    arrow(axis, (0.125, 0.60), (0.155, 0.60))
+
+    left = 0.158
+    for level, (width_now, d, r, c) in enumerate(shapes):      # encoder, narrowing
+        height = 0.34 - 0.062 * level
+        slab(axis, left, 0.59 - height / 2, 0.056, height, GREEN, depth=0.014,
+             label=f"L{level + 1}\n{width_now}ch", under=f"{d}x{r}x{c}", size=7.4)
+        arrow(axis, (left + 0.058, 0.60), (left + 0.072, 0.60))
+        left += 0.074
+    axis.text(0.31, 0.90, "encoder, 3x3x3 convolutions, stride 2, attention pooling per level",
+              fontsize=8.6, ha="center", color="#333333")
+
+    tokens(axis, 0.455, 0.575, 10, 0.0135, "#b9c7e8")
+    axis.text(0.52, 0.665, f"latent code, {96} values", fontsize=7.8, ha="center")
+    for index in range(4):                                     # the feature-map stack
+        slab(axis, 0.458 + 0.006 * index, 0.37 + 0.006 * index, 0.088, 0.095, "#cdd9ef",
+             depth=0.011, label="" if index < 3 else "latent\nfeature maps", size=7.2)
+    axis.text(0.505, 0.345, "each channel is a small 3D image,\nblock B measures it",
+              fontsize=7.4, ha="center", va="top", color="#444444")
+    arrow(axis, (0.573, 0.60), (0.60, 0.60))
+
+    left = 0.603                                               # decoder, widening back
+    for level in range(4):
+        height = 0.15 + 0.062 * level
+        slab(axis, left, 0.59 - height / 2, 0.052, height, SAND, depth=0.014,
+             label=f"D{level + 1}", size=7.4)
+        arrow(axis, (left + 0.054, 0.60), (left + 0.067, 0.60))
+        left += 0.069
+    axis.text(0.72, 0.90, "decoder, transposed convolutions", fontsize=8.6, ha="center",
+              color="#333333")
+
+    slab(axis, 0.885, 0.44, 0.095, 0.30, RED, depth=0.016,
+         label="rebuilt crop", under="L1 loss weighted 20x on the\natrial wall and the fat "
+         "within 10 mm", size=8.0)
+    box(axis, 0.60, 0.17, 0.175, 0.12,
+        "self-distillation\ntwo views, the student predicts the\nstop-gradient teacher",
+        GREY, size=7.8)
+    box(axis, 0.80, 0.17, 0.175, 0.12,
+        "feature distillation\nthe code must predict the four\nhandcrafted features",
+        GREY, size=7.8)
+    arrow(axis, (0.55, 0.37), (0.655, 0.29), dashed=True)
+    arrow(axis, (0.56, 0.38), (0.855, 0.29), dashed=True)
+    axis.text(0.50, 0.075, "40 % of the crop is hidden before the encoder, and every step here "
+              "is fitted inside the training fold only",
+              fontsize=8.2, ha="center", style="italic", color="#444444")
+
+    lower = figure.add_subplot(grid[1])
+    book = args.output / "rim" / ("rim.xlsx" if args.group == "AF" else f"rim_{args.group}.xlsx")
+    if not book.exists():
+        lower.axis("off")
+        lower.text(0.5, 0.5, f"run 29_rim_representation.py first, {book.name} not found",
+                   ha="center", va="center", fontsize=10, color="#777777")
+    else:
+        table = pd.read_excel(book, sheet_name="AUC")
+        table["auc"] = pd.to_numeric(table["auc"], errors="coerce")
+        table = table.dropna(subset=["auc"]).sort_values("auc")
+        reference = ("LA volume alone", "best four features")   # the models to beat
+        colours = ["#c0504d" if str(name).strip() in reference else "#4f81bd"
+                   for name in table["block"]]
+        bars = lower.barh(table["block"].astype(str), table["auc"], color=colours)
+        for bar, value in zip(bars, table["auc"]):
+            lower.text(value + 0.004, bar.get_y() + bar.get_height() / 2, f"{value:.3f}",
+                       va="center", fontsize=8)
+        lower.axvline(0.5, color="0.6", lw=0.8)
+        lower.set_xlim(0.45, min(1.0, float(table["auc"].max()) + 0.06))
+        lower.set_xlabel("AUC, out of fold")
+        lower.set_title("What each readout of the encoder scores, red = reference model",
+                        fontsize=10, loc="left")
+        lower.grid(axis="x", alpha=0.3)
+    plt.savefig(folder / "figure7_rim.png", dpi=220, bbox_inches="tight")
+    plt.close()
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     folder = args.output / "paper"
@@ -358,6 +458,7 @@ def main(argv=None) -> None:
     print("2. the result figures, from what is already on disk")
     figure_results(args, folder)
     figure_blocks(args, folder)
+    figure_rim(args, folder)
     tile([rim / "04_shell.png", rim / "03_attention.png",
           rim / "02_latent_space.png", latent / "02_where.png"],
          ["the shell the loss is weighted by", "where the encoder attends",
